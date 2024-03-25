@@ -10,7 +10,6 @@ links = "llama"
 
 [dependencies]
 clap = "4.5.3"
-libc = "0.2"
 
 [build-dependencies]
 bindgen = "0.58"
