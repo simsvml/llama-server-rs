@@ -2,7 +2,7 @@ use std::ffi::CString;
 use std::marker::PhantomData;
 use std::ptr::{self, NonNull};
 use std::slice;
-use std::str;
+use std::str::{self, Utf8Error};
 
 
 pub mod ffi {
@@ -107,6 +107,7 @@ impl LlamaModel {
         }
     }
 
+    // TODO: this panics on bad utf8 - do any models produce such output?
     pub fn try_token_to_piece_str<'a>(
         &self,
         token: ffi::llama_token,
@@ -114,6 +115,32 @@ impl LlamaModel {
     ) -> Result<&'a str, usize> {
         let old_len = buf.len();
         self.try_token_to_piece(token, buf)?;
+        let new_len = buf.len();
+        let s = str::from_utf8(&buf[old_len..new_len]).unwrap();
+        Ok(s)
+    }
+
+    pub fn token_to_piece(
+        &self,
+        token: ffi::llama_token,
+        buf: &mut Vec<u8>,
+    ) -> usize {
+        match self.try_token_to_piece(token, buf) {
+            Ok(n) => return n,
+            Err(need) => {
+                buf.reserve(need);
+                self.try_token_to_piece(token, buf).unwrap()
+            },
+        }
+    }
+
+    pub fn token_to_piece_str<'a>(
+        &self,
+        token: ffi::llama_token,
+        buf: &'a mut Vec<u8>,
+    ) -> Result<&'a str, Utf8Error> {
+        let old_len = buf.len();
+        self.token_to_piece(token, buf);
         let new_len = buf.len();
         let s = str::from_utf8(&buf[old_len..new_len]).unwrap();
         Ok(s)
