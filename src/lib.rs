@@ -18,7 +18,6 @@ pub type LlamaToken = ffi::llama_token;
 pub type LlamaTokenData = ffi::llama_token_data;
 pub type LlamaModelParams = ffi::llama_model_params;
 pub type LlamaContextParams = ffi::llama_context_params;
-pub type LlamaSeqId = ffi::llama_seq_id;
 
 
 #[derive(Debug)]
@@ -199,6 +198,12 @@ impl<'a> LlamaContext<'a> {
         }
     }
 
+    pub fn n_seq_max(&self) -> usize {
+        unsafe {
+            ffi::llama_n_seq_max(self.as_ptr()).try_into().unwrap()
+        }
+    }
+
     /// Process a batch of tokens.
     ///
     /// This takes `&mut`, so it can't be called while a borrow from `logits_ith` is outstanding.
@@ -263,12 +268,12 @@ pub struct LlamaBatch {
 }
 
 impl LlamaBatch {
-    pub fn new(n_tokens: usize) -> LlamaBatch {
+    pub fn new(n_tokens: usize, n_seq_max: usize) -> LlamaBatch {
         unsafe {
             let batch = ffi::llama_batch_init(
                 n_tokens.try_into().unwrap(),
                 0,  // embd
-                1,  // n_seq_max
+                n_seq_max.try_into().unwrap(),
             );
             LlamaBatch {
                 batch,
@@ -294,7 +299,7 @@ impl LlamaBatch {
         &mut self,
         token: ffi::llama_token,
         pos: usize,
-        seq_id: ffi::llama_seq_id,
+        seq_id: usize,
         logits: bool,
     ) {
         unsafe {
@@ -303,7 +308,7 @@ impl LlamaBatch {
             *self.batch.token.add(i) = token;
             *self.batch.pos.add(i) = pos.try_into().unwrap();
             *self.batch.n_seq_id.add(i) = 1;
-            *(*self.batch.seq_id.add(i)).add(0) = seq_id;
+            *(*self.batch.seq_id.add(i)).add(0) = seq_id.try_into().unwrap();
             *self.batch.logits.add(i) = logits as i8;
 
             self.batch.n_tokens += 1;

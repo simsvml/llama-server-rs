@@ -7,10 +7,10 @@ use clap::{Command, Arg, ArgMatches, value_parser};
 use serde::{Serialize, Deserialize};
 use serde_json;
 use llama_server_rs::{
-    LlamaModel, default_model_params, LlamaContext, default_context_params, LlamaBatch, LlamaSeqId,
-    LlamaToken, LlamaTokenData, LlamaTokenDataArray,
+    LlamaModel, default_model_params, LlamaContext, default_context_params, LlamaBatch, LlamaToken,
+    LlamaTokenData, LlamaTokenDataArray,
 };
-    
+use llama_server_rs::ffi as ffi;
 
 fn parse_args() -> ArgMatches {
     Command::new("llama-server-rs")
@@ -22,9 +22,10 @@ fn parse_args() -> ArgMatches {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "lowercase")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 enum Request<'a> {
     Completion(CompletionRequest<'a>),
+    BatchCompletion(BatchCompletionRequest<'a>),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -32,17 +33,30 @@ struct CompletionRequest<'a> {
     prompt: Cow<'a, str>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct BatchCompletionRequest<'a> {
+    #[serde(flatten)]
+    c: CompletionRequest<'a>,
+    batch_size: usize,
+}
+
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "lowercase")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 enum Response<'a> {
     Completion(CompletionResponse<'a>),
+    BatchCompletion(BatchCompletionResponse<'a>),
     Error(ErrorResponse<'a>),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CompletionResponse<'a> {
     content: Cow<'a, str>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct BatchCompletionResponse<'a> {
+    content: Cow<'a, [String]>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -53,6 +67,12 @@ struct ErrorResponse<'a> {
 impl<'a> From<CompletionResponse<'a>> for Response<'a> {
     fn from(x: CompletionResponse<'a>) -> Response<'a> {
         Response::Completion(x)
+    }
+}
+
+impl<'a> From<BatchCompletionResponse<'a>> for Response<'a> {
+    fn from(x: BatchCompletionResponse<'a>) -> Response<'a> {
+        Response::BatchCompletion(x)
     }
 }
 
@@ -105,7 +125,10 @@ impl<'a, 'b> ServerContext<'a, 'b> {
         req: &Request,
     ) -> Result<(), String> {
         match *req {
-            Request::Completion(ref cr) => self.handle_completion_request(socket, cr),
+            Request::Completion(ref cr) =>
+                self.handle_completion_request(socket, cr),
+            Request::BatchCompletion(ref bcr) =>
+                self.handle_batch_completion_request(socket, bcr),
         }
     }
 
@@ -124,7 +147,7 @@ impl<'a, 'b> ServerContext<'a, 'b> {
         let mut token_data = self.empty_token_data();
         let mut token_buf = Vec::with_capacity(64);
         let mut content = String::new();
-        let mut batch = LlamaBatch::new(1);
+        let mut batch = LlamaBatch::new(1, 1);
         for offset in 0 .. 128 {
             let pos = tokens.len() + offset;
             let logits_index = if offset == 0 { tokens.len() - 1 } else { 0 };
@@ -138,6 +161,7 @@ impl<'a, 'b> ServerContext<'a, 'b> {
             // TODO: Stop on EOS token
 
             // Process the newly added token.
+            // TODO: Skip this part on the final iteration, since its results aren't used.
             batch.clear();
             batch.push(token, pos, /* seq_id: */ 0, true);
             self.ctx.decode(&batch)?;
@@ -149,6 +173,88 @@ impl<'a, 'b> ServerContext<'a, 'b> {
         }.into());
 
         Ok(())
+    }
+
+    fn handle_batch_completion_request(
+        &mut self,
+        socket: impl Write,
+        req: &BatchCompletionRequest,
+    ) -> Result<(), String> {
+        // Tokenize and process the prompt.
+        let tokens = self.tokenize(&req.c.prompt)?;
+        let batch = batch_with_tokens(&tokens, /* start_pos: */ 0, /* seq_id: */ 0);
+        self.ctx.decode(&batch)?;
+        drop(batch);
+
+        if req.batch_size > self.ctx.n_seq_max() {
+            return Err(format!("batch size of {} is too high; max is {}",
+                req.batch_size, self.ctx.n_seq_max()));
+        }
+
+        // Populate all sequences in the KV cache with the prompt data.
+        for i in 1 .. req.batch_size {
+            unsafe {
+                // Copy all data from sequence 0 to sequence `i`.
+                ffi::llama_kv_cache_seq_cp(
+                    self.ctx.as_ptr(),
+                    0,
+                    i.try_into().unwrap(),
+                    -1,
+                    -1,
+                );
+            }
+        }
+
+
+        // Sampling
+        let mut token_data = self.empty_token_data();
+        let mut token_buf = Vec::with_capacity(64);
+        let mut content = (0 .. req.batch_size).map(|_| String::new()).collect::<Vec<_>>();
+        let mut batch = LlamaBatch::new(req.batch_size, req.batch_size);
+        for offset in 0 .. 32 {
+            let pos = tokens.len() + offset;
+
+            batch.clear();
+
+            // Sample tokens and prepare a new batch.
+            if offset == 0 {
+                // Initially, we sample continuations of the prompt, all using the logits from the
+                // last prompt token.
+                for (i, s) in content.iter_mut().enumerate() {
+                    // TODO: Reuse the same final token_data for each `llama_sample_token` call.
+                    let token = self.sample_token(tokens.len() - 1, &mut token_data);
+                    let token_str = self.token_to_str(token, &mut token_buf)?;
+                    s.push_str(token_str);
+                    batch.push(token, pos, /* seq_id: */ i, /* logits: */ true);
+                }
+            } else {
+                // Afterward, we get separate logits for each completion in the batch.
+                for (i, s) in content.iter_mut().enumerate() {
+                    let token = self.sample_token(i, &mut token_data);
+                    let token_str = self.token_to_str(token, &mut token_buf)?;
+                    s.push_str(token_str);
+                    batch.push(token, pos, /* seq_id: */ i, /* logits: */ true);
+                }
+            }
+
+            // TODO: Stop on EOS token
+            // TODO: Allow some completions in the batch to stop early.
+
+            // Process the newly added tokens.
+            self.ctx.decode(&batch)?;
+        }
+
+        eprintln!("{} completions:", req.batch_size);
+        for s in &content {
+            eprintln!("  {}", s);
+        }
+
+        send_response(socket, &BatchCompletionResponse {
+            content: content.into(),
+        }.into());
+
+        Ok(())
+
     }
 
     fn tokenize(&self, s: &str) -> Result<Vec<LlamaToken>, String> {
@@ -207,9 +313,9 @@ impl<'a, 'b> ServerContext<'a, 'b> {
 fn batch_with_tokens(
     tokens: &[LlamaToken],
     start_pos: usize,
-    seq_id: LlamaSeqId,
+    seq_id: usize,
 ) -> LlamaBatch {
-    let mut batch = LlamaBatch::new(tokens.len());
+    let mut batch = LlamaBatch::new(tokens.len(), 1);
     for (i, &tok) in tokens.iter().enumerate() {
         let last = i == tokens.len() - 1;
         batch.push(tok, start_pos + i, seq_id, last);
