@@ -1,5 +1,6 @@
 use std::ffi::CString;
 use std::marker::PhantomData;
+use std::ops::{Deref, DerefMut};
 use std::ptr::{self, NonNull};
 use std::slice;
 use std::str::{self, Utf8Error};
@@ -17,6 +18,7 @@ pub type LlamaToken = ffi::llama_token;
 pub type LlamaTokenData = ffi::llama_token_data;
 pub type LlamaModelParams = ffi::llama_model_params;
 pub type LlamaContextParams = ffi::llama_context_params;
+pub type LlamaSeqId = ffi::llama_seq_id;
 
 
 #[derive(Debug)]
@@ -37,6 +39,12 @@ impl LlamaModel {
 
     pub fn as_ptr(&self) -> *mut ffi::llama_model {
         self.0.as_ptr()
+    }
+
+    pub fn n_vocab(&self) -> usize {
+        unsafe {
+            ffi::llama_n_vocab(self.as_ptr()).try_into().unwrap()
+        }
     }
 
     /// Tokenize `text`, appending the tokens to `tokens`.  This never grows `tokens`; the caller
@@ -348,6 +356,34 @@ impl<'a> LlamaTokenDataArray<'a> {
 
     pub fn as_mut_ptr(&mut self) -> *mut ffi::llama_token_data_array {
         ptr::addr_of_mut!(self.raw)
+    }
+}
+
+impl Deref for LlamaTokenDataArray<'_> {
+    type Target = [LlamaTokenData];
+
+    fn deref(&self) -> &[LlamaTokenData] {
+        unsafe {
+            // This is safe because `data` and `size` are initially set by deconstructing a slice,
+            // and none of the llama.cpp methods we use modify those fields.
+            slice::from_raw_parts(
+                self.raw.data,
+                self.raw.size as usize,
+            )
+        }
+    }
+}
+
+impl DerefMut for LlamaTokenDataArray<'_> {
+    fn deref_mut(&mut self) -> &mut [LlamaTokenData] {
+        unsafe {
+            // This is safe because `data` and `size` are initially set by deconstructing a slice,
+            // and none of the llama.cpp methods we use modify those fields.
+            slice::from_raw_parts_mut(
+                self.raw.data,
+                self.raw.size as usize,
+            )
+        }
     }
 }
 

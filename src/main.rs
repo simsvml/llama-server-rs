@@ -7,8 +7,8 @@ use clap::{Command, Arg, ArgMatches, value_parser};
 use serde::{Serialize, Deserialize};
 use serde_json;
 use llama_server_rs::{
-    LlamaModel, default_model_params, LlamaContext, default_context_params, LlamaBatch,
-    LlamaTokenData, LlamaTokenDataArray,
+    LlamaModel, default_model_params, LlamaContext, default_context_params, LlamaBatch, LlamaSeqId,
+    LlamaToken, LlamaTokenData, LlamaTokenDataArray,
 };
     
 
@@ -114,67 +114,33 @@ impl<'a, 'b> ServerContext<'a, 'b> {
         socket: impl Write,
         req: &CompletionRequest,
     ) -> Result<(), String> {
-        // Tokenize input
-        let mut tokens = Vec::with_capacity(self.ctx.n_ctx());
-        self.model.try_tokenize(&req.prompt, &mut tokens, /* add_bos: */ true, /* special: */ true)
-            .map_err(|n| format!("input has too many tokens: {}", n))?;
-        eprintln!("tokens = {:?}", tokens);
-
-        // Prompt processing
-        let mut batch = LlamaBatch::new(tokens.len());
-        for (i, &tok) in tokens.iter().enumerate() {
-            let last = i == tokens.len() - 1;
-            batch.push(tok, i, /* seq_id: */ 0, last);
-        }
-
+        // Tokenize and process the prompt.
+        let tokens = self.tokenize(&req.prompt)?;
+        let batch = batch_with_tokens(&tokens, /* start_pos: */ 0, /* seq_id: */ 0);
         self.ctx.decode(&batch)?;
-        eprintln!("llama_decode ok");
-
+        drop(batch);
 
         // Sampling
-        let mut pos = tokens.len();
-        let end_pos = pos + 128;
-        let mut logits_index = pos - 1;
+        let mut token_data = self.empty_token_data();
         let mut token_buf = Vec::with_capacity(64);
         let mut content = String::new();
-        loop {
-            // Sample token
-            let logits = self.ctx.logits_ith(logits_index);
-            let mut token_data = logits.iter().enumerate().map(|(i, &logit)| {
-                LlamaTokenData {
-                    id: i.try_into().unwrap(),
-                    logit,
-                    p: 0.,
-                }
-            }).collect::<Vec<_>>();
+        let mut batch = LlamaBatch::new(1);
+        for offset in 0 .. 128 {
+            let pos = tokens.len() + offset;
+            let logits_index = if offset == 0 { tokens.len() - 1 } else { 0 };
 
-            let mut candidates = LlamaTokenDataArray::new(&mut token_data);
-
-            self.ctx.sample_softmax(&mut candidates);
-            let token = self.ctx.sample_token(&mut candidates);
-
-            token_buf.clear();
-            let token_str = self.model.token_to_piece_str(token, &mut token_buf)
-                .map_err(|e| format!("bad utf8 in model output: {}", e))?;
+            let token = self.sample_token(logits_index, &mut token_data);
+            let token_str = self.token_to_str(token, &mut token_buf)?;
 
             eprint!("{}", token_str);
-            //eprintln!("sampled token {} = {:?}", token, token_str);
             content.push_str(token_str);
-
-            if pos >= end_pos {
-                break;
-            }
 
             // TODO: Stop on EOS token
 
-            // Prepare next batch
+            // Process the newly added token.
             batch.clear();
-            batch.push(token, /* pos: */ pos, /* seq_id: */ 0, true);
-            pos += 1;
-            logits_index = 0;
-
+            batch.push(token, pos, /* seq_id: */ 0, true);
             self.ctx.decode(&batch)?;
-            //eprintln!("llama_decode ok");
         }
         eprintln!();
 
@@ -184,6 +150,71 @@ impl<'a, 'b> ServerContext<'a, 'b> {
 
         Ok(())
     }
+
+    fn tokenize(&self, s: &str) -> Result<Vec<LlamaToken>, String> {
+        let mut tokens = Vec::with_capacity(self.ctx.n_ctx());
+        self.model.try_tokenize(s, &mut tokens, /* add_bos: */ true, /* special: */ true)
+            .map_err(|n| format!("input has too many tokens: {}", n))?;
+        Ok(tokens)
+    }
+
+    /// Build an empty array of token data with length equal to `n_vocab`.
+    fn empty_token_data(&self) -> Box<[LlamaTokenData]> {
+        let n_vocab = self.model.n_vocab();
+        let v = vec![LlamaTokenData { id: 0, logit: 0., p: 0. }; n_vocab];
+        v.into_boxed_slice()
+    }
+
+    /// Sample the next token based on the logits for `token_idx` from the last batch.  Uses `buf`
+    /// as scratch space; it must have length equal to `n_vocab`.
+    fn sample_token(&self, token_idx: usize, buf: &mut [LlamaTokenData]) -> LlamaToken {
+        debug_assert_eq!(buf.len(), self.model.n_vocab());
+
+        let logits = self.ctx.logits_ith(token_idx);
+        for (i, (&logit, data)) in logits.iter().zip(buf.iter_mut()).enumerate() {
+            // The whole buffer is potentially invalid, so we set all fields.  Even `id` may be
+            // modified, since `llama_sample_softmax` sorts the array by logit.
+            data.id = i.try_into().unwrap();
+            data.logit = logit;
+            // Clear `p` so that calling `sample_token` without doing the necessary processing
+            // first will fail in an obvious way.
+            data.p = 0.;
+        }
+
+        let mut candidates = LlamaTokenDataArray::new(buf);
+
+        self.ctx.sample_softmax(&mut candidates);
+        let token = self.ctx.sample_token(&mut candidates);
+        token
+    }
+
+    /// Convert `token` to a string.  Uses `str_buf` as scratch space.
+    fn token_to_str<'s>(
+        &self,
+        token: LlamaToken,
+        str_buf: &'s mut Vec<u8>,
+    ) -> Result<&'s str, String> {
+        str_buf.clear();
+        let token_str = self.model.token_to_piece_str(token, str_buf)
+            .map_err(|e| format!("bad utf8 in model output: {}", e))?;
+        Ok(token_str)
+    }
+}
+
+/// Make a batch containing the sequence `tokens`.  The first token is placed at `start_pos`, and
+/// remaining tokens are placed at sequentially increasing positions, all in sequence `seq_id`.
+/// Logits are requested for the last token only.
+fn batch_with_tokens(
+    tokens: &[LlamaToken],
+    start_pos: usize,
+    seq_id: LlamaSeqId,
+) -> LlamaBatch {
+    let mut batch = LlamaBatch::new(tokens.len());
+    for (i, &tok) in tokens.iter().enumerate() {
+        let last = i == tokens.len() - 1;
+        batch.push(tok, start_pos + i, seq_id, last);
+    }
+    batch
 }
 
 
@@ -214,7 +245,7 @@ fn main() -> io::Result<()> {
     if socket_path.exists() {
         fs::remove_file(socket_path)?;
     }
-    let mut listener = UnixListener::bind(socket_path)?;
+    let listener = UnixListener::bind(socket_path)?;
 
     let mut line_buf = String::new();
     for socket in listener.incoming() {
