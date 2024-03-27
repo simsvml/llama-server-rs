@@ -283,6 +283,13 @@ impl<'a> LlamaContext<'a> {
         }
     }
 
+    /// Clear all data from the KV cache.
+    pub fn kv_cache_clear(&self) {
+        unsafe {
+            ffi::llama_kv_cache_seq_rm(self.as_ptr(), -1, -1, -1);
+        }
+    }
+
     pub fn sample_softmax(&self, candidates: &mut LlamaTokenDataArray) {
         unsafe {
             ffi::llama_sample_softmax(self.as_ptr(), candidates.as_mut_ptr())

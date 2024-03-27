@@ -212,6 +212,8 @@ impl<'a, 'b> ServerContext<'a, 'b> {
         socket: impl Write,
         req: &CompletionRequest,
     ) -> Result<(), String> {
+        self.ctx.kv_cache_clear();
+
         // Tokenize and process the prompt.
         let tokens = self.tokenize(&req.prompt)?;
         let batch = batch_with_tokens(&tokens, /* start_pos: */ 0, /* seq_id: */ 0);
@@ -255,6 +257,8 @@ impl<'a, 'b> ServerContext<'a, 'b> {
         socket: impl Write,
         req: &BatchCompletionRequest,
     ) -> Result<(), String> {
+        self.ctx.kv_cache_clear();
+
         // Tokenize and process the prompt.
         let tokens = self.tokenize(&req.prompt)?;
         let batch = batch_with_tokens(&tokens, /* start_pos: */ 0, /* seq_id: */ 0);
@@ -547,10 +551,7 @@ impl<'a, 'b> ServerContext<'a, 'b> {
             cb_state_access.tokens_seen.fill(0);
             cb_state_access.token_prompt_map.clear();
 
-            // Completely clear the KV cache.
-            unsafe {
-                ffi::llama_kv_cache_seq_rm(ctx.as_ptr(), -1, -1, -1);
-            }
+            ctx.kv_cache_clear();
 
             // Populate the batch with prompts until we run out of prompts, batch space, or
             // seq_ids.
