@@ -1,8 +1,14 @@
 use std::borrow::Cow;
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, BufReader, BufRead, Write};
+use std::io::{self, BufReader, BufRead, Write, BufWriter};
+use std::mem;
+use std::os::raw::c_void;
 use std::os::unix::net::UnixListener;
 use std::path::Path;
+use std::slice;
+use std::str;
 use clap::{Command, Arg, ArgMatches, value_parser};
 use serde::{Serialize, Deserialize};
 use serde_json;
@@ -26,6 +32,7 @@ fn parse_args() -> ArgMatches {
 enum Request<'a> {
     Completion(CompletionRequest<'a>),
     BatchCompletion(BatchCompletionRequest<'a>),
+    HiddenStates(HiddenStatesRequest<'a>),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -39,12 +46,18 @@ struct BatchCompletionRequest<'a> {
     batch_size: usize,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct HiddenStatesRequest<'a> {
+    prompts: Cow<'a, [String]>,
+}
+
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Response<'a> {
     Completion(CompletionResponse<'a>),
     BatchCompletion(BatchCompletionResponse<'a>),
+    HiddenStates(HiddenStatesResponse),
     Error(ErrorResponse<'a>),
 }
 
@@ -56,6 +69,21 @@ struct CompletionResponse<'a> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct BatchCompletionResponse<'a> {
     content: Cow<'a, [String]>,
+}
+
+/// Response header giving hidden state vectors for a set of prompts.  The JSON response header is
+/// followed by a payload consisting of `n_prompt * n_layer * n_embd` 32-bit floats, with the float
+/// values sent in little-endian order.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct HiddenStatesResponse {
+    /// Number of prompts for which hidden states are provided.  This is the same as
+    /// `prompts.len()` from the request.
+    n_prompt: usize,
+    /// Number of layers in the model.  For each prompt, the payload contains a vector for each
+    /// layer of the model.
+    n_layer: usize,
+    /// Number of values in each hidden state vector.
+    n_embd: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -75,6 +103,12 @@ impl<'a> From<BatchCompletionResponse<'a>> for Response<'a> {
     }
 }
 
+impl<'a> From<HiddenStatesResponse> for Response<'a> {
+    fn from(x: HiddenStatesResponse) -> Response<'a> {
+        Response::HiddenStates(x)
+    }
+}
+
 impl<'a> From<ErrorResponse<'a>> for Response<'a> {
     fn from(x: ErrorResponse<'a>) -> Response<'a> {
         Response::Error(x)
@@ -82,19 +116,55 @@ impl<'a> From<ErrorResponse<'a>> for Response<'a> {
 }
 
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum HiddenStatesStreamingResponse<'a> {
+    Done,
+    Error(ErrorResponse<'a>),
+    #[serde(untagged)]
+    Chunk(HiddenStatesChunkHeader<'a>),
+}
+
+/// Chunk header used when streaming hidden state vectors.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct HiddenStatesChunkHeader<'a> {
+    /// The layer whose data is contained in this chunk.
+    #[serde(rename = "l")]
+    layer: usize,
+    /// The prompts whose data is contained in this chunk.
+    #[serde(rename = "p")]
+    prompts: Cow<'a, [usize]>,
+}
+
+
+fn write_json(socket: &mut impl Write, x: &impl Serialize) -> io::Result<()> {
+    serde_json::to_writer(&mut *socket, x)?;
+    socket.write_all(b"\n")?;
+    socket.flush()?;
+    Ok(())
+}
+
+/// Try to send `resp` on `socket`.  Returns `Err` if this fails.
+fn try_send_message(socket: impl Write, resp: &impl Serialize) -> Result<(), String> {
+    let mut socket = BufWriter::new(socket);
+    write_json(&mut socket, &resp)
+        .map_err(|e| format!("error sending response: {}", e))?;
+    Ok(())
+}
+
 /// Send `resp` on `socket`.  This first tries to send `resp`; if that fails, it tries to send an
 /// error message; and if that also fails, it gives up and returns without  doing anything.
-fn send_response(mut socket: impl Write, resp: &Response) {
-    let resp_json = serde_json::to_string(&resp).unwrap();
-    let err = match socket.write_all(resp_json.as_bytes()) {
+fn send_message(socket: impl Write, resp: &impl Serialize) {
+    let mut socket = BufWriter::new(socket);
+
+    let err = match write_json(&mut socket, &resp) {
         Ok(_) => return,
         Err(e) => format!("error sending response: {}", e),
     };
     let err_resp = Response::Error(ErrorResponse {
         msg: (&err).into(),
     });
-    let err_resp_json = serde_json::to_string(&err_resp).unwrap();
-    match socket.write_all(err_resp_json.as_bytes()) {
+    match write_json(&mut socket, &err_resp) {
         Ok(_) => return,
         Err(e) => {
             // Give up
@@ -102,6 +172,10 @@ fn send_response(mut socket: impl Write, resp: &Response) {
             return;
         },
     }
+}
+
+fn send_response(socket: impl Write, resp: &Response) {
+    send_message(socket, resp);
 }
 
 
@@ -128,6 +202,8 @@ impl<'a, 'b> ServerContext<'a, 'b> {
                 self.handle_completion_request(socket, cr),
             Request::BatchCompletion(ref bcr) =>
                 self.handle_batch_completion_request(socket, bcr),
+            Request::HiddenStates(ref hsr) =>
+                self.handle_hidden_states_request(socket, hsr),
         }
     }
 
@@ -253,7 +329,269 @@ impl<'a, 'b> ServerContext<'a, 'b> {
         }.into());
 
         Ok(())
+    }
 
+    /// Handle a request for hidden states from a set of prompts.
+    ///
+    /// The response looks like this:
+    ///
+    /// ```json
+    /// {"kind": "hidden_states_response", "n_layer": <n>, ...} \n
+    /// {"layer": <i>, "prompts": [<j0>, <j1>, ...]} \n <floating-point data>
+    /// {"layer": <i>, "prompts": [<j0>, <j1>, ...]} \n <floating-point data>
+    /// {"kind": "done"} \n
+    /// ```
+    ///
+    /// Each JSON object is followed by a newline.  Binary data is *not* followed by a newline.
+    ///
+    /// The response has three parts:
+    ///
+    /// 1. A tagged `HiddenStatesResponse` containing the dimensions of the data.
+    /// 2. The data itself, transmitted in chunks.  Each chunk is preceded by a
+    ///    `HiddenStatesChunkHeader` indicating where it belongs in the output tensor.  The chunk's
+    ///    floating-point data consists of `n_embd` floats for prompt `prompts[0]` and layer
+    ///    `layer`, then `n_embd` more floats for `prompts[1], layer`, and so on.
+    /// 3. A final object containing only `{"kind": "done"}`, indicating that all chunks have been
+    ///    transmitted.
+    ///
+    /// Any of these objects may be replaced with a tagged `ErrorResponse`, after which the client
+    /// should close the connection.  (The server might send more data, possibly including
+    /// additional chunks or `ErrorResponse`s, but it is not likely to be meaningful.)
+    fn handle_hidden_states_request(
+        &mut self,
+        mut socket: impl Write,
+        req: &HiddenStatesRequest,
+    ) -> Result<(), String> {
+        let n_embd = self.model.n_embd();
+        try_send_message(&mut socket, &Response::from(HiddenStatesResponse {
+            n_prompt: req.prompts.len(),
+            n_layer: self.model.n_layer(),
+            n_embd,
+        }))?;
+
+        // Eval callback
+        #[derive(Clone, Debug, Default)]
+        struct CallbackState<W> {
+            socket: W,
+            error: Option<String>,
+            /// Number of tokens we've already seen in each layer.  llama.cpp splits the input
+            /// batch of size `n_batch` into pieces of size `n_ubatch` for processing.  Tokens from
+            /// previous ubatches are counted here so we know where the next tokens fall within the
+            /// overall batch.
+            tokens_seen: Box<[usize]>,
+            /// Map from token index to prompt index.  For each entry `(token, prompt)` in this
+            /// map, the token at position `token` in the batch is the last token of `prompt` (and
+            /// thus should have its internal states extracted).
+            token_prompt_map: BTreeMap<usize, usize>,
+            /// Buffer for hidden states.  Data is copied here before being sent out.
+            data_buf: Vec<f32>,
+            /// Buffer for collecting prompt indices to be listed in the header.
+            prompts_buf: Vec<usize>,
+        }
+        let cb_state = RefCell::new(CallbackState {
+            socket: &mut socket,
+            error: None,
+            tokens_seen: vec![0; self.model.n_layer()].into_boxed_slice(),
+            token_prompt_map: BTreeMap::new(),
+            data_buf: Vec::new(),
+            prompts_buf: Vec::new(),
+        });
+
+        let mut callback = |t: *mut ffi::ggml_tensor, ask| -> bool {
+            // Get the tensor name.  The name is stored as a fixed-size array of `c_char` with a
+            // null terminator.  We convert it to a slice and drop the terminator and everything
+            // after it.
+            let name = unsafe { (*t).name.as_slice() };
+            let name = unsafe { mem::transmute::<&[i8], &[u8]>(name) };
+            let name_len = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+            let name = &name[..name_len];
+            /*
+            eprintln!("running {} callback on {:?}",
+                if ask { "ask" } else { "inspect" },
+                String::from_utf8_lossy(name));
+            */
+
+            if ask {
+                // We only want to inspect the contents of the layer output tensors.
+                return name.starts_with(b"l_out-");
+            }
+
+            // In the non-ask case, we return true in all non-error cases so that inference
+            // continues.
+
+            let name_suffix = match name.strip_prefix(b"l_out-") {
+                Some(s) => s,
+                None => return true,
+            };
+
+            let mut state = cb_state.borrow_mut();
+            let state = &mut *state;
+            if state.error.is_some() {
+                // Don't send more chunks if we've already encountered an error.
+                return false;
+            }
+
+            let layer_idx = str::from_utf8(name_suffix).unwrap()
+                .parse::<usize>().unwrap();
+
+            unsafe {
+                let ubatch_len = usize::try_from((*t).ne[1]).unwrap();
+                let ubatch_start = state.tokens_seen[layer_idx];
+                let ubatch_end = ubatch_start + ubatch_len;
+                state.tokens_seen[layer_idx] += ubatch_len;
+
+                state.prompts_buf.clear();
+                state.prompts_buf.extend(
+                    state.token_prompt_map.range(ubatch_start .. ubatch_end)
+                        .map(|(_, &prompt)| prompt)
+                );
+
+                let r = try_send_message(
+                    &mut *state.socket,
+                    &HiddenStatesStreamingResponse::Chunk(HiddenStatesChunkHeader {
+                        layer: layer_idx,
+                        prompts: (&state.prompts_buf).into(),
+                    }),
+                );
+                match r {
+                    Ok(()) => {},
+                    Err(e) => {
+                        state.error = Some(e);
+                        return false;
+                    },
+                }
+
+                let data_buf = &mut state.data_buf;
+                data_buf.clear();
+                data_buf.reserve(state.prompts_buf.len() * n_embd);
+
+                type Element = f32;
+
+                assert_eq!(usize::try_from((*t).ne[0]).unwrap(), n_embd);
+                assert_eq!(usize::try_from((*t).nb[0]).unwrap(), mem::size_of::<Element>());
+
+                let token_prompt_iter =
+                    state.token_prompt_map.range(ubatch_start .. ubatch_end)
+                        .enumerate();
+                for (i, (&token_idx, &prompt_idx)) in token_prompt_iter {
+                    let input_idx = token_idx - ubatch_start;
+                    let input_byte_offset = usize::try_from((*t).nb[1]).unwrap() * input_idx;
+                    debug_assert_eq!(input_byte_offset % mem::size_of::<Element>(), 0);
+                    let output_idx = i;
+                    let output_byte_offset = n_embd * output_idx * mem::size_of::<Element>();
+                    // TODO: It might be faster to use `ggml_backend_tensor_get_async` here, but we
+                    // don't have a way to get the necessary `ggml_backend_t` handle.
+                    ffi::ggml_backend_tensor_get(
+                        t,
+                        data_buf.as_mut_ptr().cast::<u8>().add(output_byte_offset)
+                            .cast::<c_void>(),
+                        input_byte_offset.try_into().unwrap(),
+                        (n_embd * mem::size_of::<Element>()).try_into().unwrap(),
+                    );
+
+                    data_buf.set_len(n_embd * (i + 1));
+                }
+
+                assert_eq!(data_buf.len(), state.prompts_buf.len() * n_embd);
+
+                // Flip float values to little endian if needed.
+                #[cfg(target_endian = "big")] {
+                    let data_words = slice::from_raw_parts_mut(
+                        data_buf.as_mut_ptr().cast::<u32>(),
+                        data_buf.len(),
+                    );
+                    for w in data_words {
+                        *w = (*w).swap_bytes();
+                    }
+                }
+
+                let data_bytes = slice::from_raw_parts(
+                    data_buf.as_ptr().cast::<u8>(),
+                    data_buf.len() * mem::size_of::<Element>(),
+                );
+                match state.socket.write_all(data_bytes) {
+                    Ok(()) => {},
+                    Err(e) => {
+                        state.error = Some(format!("failed to send tensor data: {}", e));
+                        return false;
+                    },
+                }
+            }
+
+            true
+        };
+
+        // Create a new context specifically for this request.
+        let mut context_params = default_context_params();
+        context_params.n_ctx = self.ctx.n_ctx().try_into().unwrap();
+        context_params.n_batch = self.ctx.n_batch().try_into().unwrap();
+        context_params.n_seq_max = self.ctx.n_batch().try_into().unwrap();
+
+        let mut ctx = LlamaContext::with_model_and_eval_callback(
+            &self.model,
+            context_params,
+            &mut callback,
+        ).ok_or("failed to create context")?;
+
+        // Tokenize each prompt.
+        let prompt_tokens =
+            req.prompts.iter().map(|s| self.tokenize(s)).collect::<Result<Vec<_>, _>>()?;
+
+        let mut batch = LlamaBatch::new(ctx.n_batch(), ctx.n_seq_max());
+
+        let mut prompt_tokens = prompt_tokens.iter().enumerate().peekable();
+        while prompt_tokens.peek().is_some() {
+            batch.clear();
+
+            let mut cb_state_access = cb_state.borrow_mut();
+            cb_state_access.tokens_seen.fill(0);
+            cb_state_access.token_prompt_map.clear();
+
+            // Completely clear the KV cache.
+            unsafe {
+                ffi::llama_kv_cache_seq_rm(ctx.as_ptr(), -1, -1, -1);
+            }
+
+            // Populate the batch with prompts until we run out of prompts, batch space, or
+            // seq_ids.
+            let mut seq_ids = 0 .. ctx.n_seq_max();
+            loop {
+                let (prompt_idx, prompt) = match prompt_tokens.peek() {
+                    Some(&p) => p,
+                    None => break,
+                };
+                let seq_id = match seq_ids.next() {
+                    Some(i) => i,
+                    None => break,
+                };
+                if prompt.len() > batch.capacity() - batch.len() {
+                    break;
+                }
+
+                for (pos, &token) in prompt.iter().enumerate() {
+                    let logits = pos == prompt.len() - 1;
+                    batch.push(token, pos, seq_id, logits);
+                }
+                cb_state_access.token_prompt_map.insert(batch.len() - 1, prompt_idx);
+
+                prompt_tokens.next();
+            }
+
+            eprintln!("run batch with {} tokens, {} seqs", batch.len(), seq_ids.start);
+
+            // Drop the `borrow_mut` so the callback can access the state without a panic.
+            drop(cb_state_access);
+
+            ctx.decode(&batch)?;
+        }
+
+        // Drop everything that borrows `socket` so we can send a final message with it.
+        drop(ctx);
+        drop(callback);
+        drop(cb_state);
+
+        try_send_message(&mut socket, &HiddenStatesStreamingResponse::Done)?;
+        Ok(())
     }
 
     fn tokenize(&self, s: &str) -> Result<Vec<LlamaToken>, String> {

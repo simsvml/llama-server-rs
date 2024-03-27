@@ -1,6 +1,7 @@
 use std::ffi::CString;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
+use std::os::raw::c_void;
 use std::ptr::{self, NonNull};
 use std::slice;
 use std::str::{self, Utf8Error};
@@ -43,6 +44,18 @@ impl LlamaModel {
     pub fn n_vocab(&self) -> usize {
         unsafe {
             ffi::llama_n_vocab(self.as_ptr()).try_into().unwrap()
+        }
+    }
+
+    pub fn n_embd(&self) -> usize {
+        unsafe {
+            ffi::llama_n_embd(self.as_ptr()).try_into().unwrap()
+        }
+    }
+
+    pub fn n_layer(&self) -> usize {
+        unsafe {
+            ffi::llama_n_layer(self.as_ptr()).try_into().unwrap()
         }
     }
 
@@ -188,6 +201,30 @@ impl<'a> LlamaContext<'a> {
         }
     }
 
+    pub fn with_model_and_eval_callback<F>(
+        model: &'a LlamaModel,
+        context_params: ffi::llama_context_params,
+        callback: &'a mut F,
+    ) -> Option<LlamaContext<'a>>
+    where F: FnMut(*mut ffi::ggml_tensor, bool) -> bool {
+        let mut context_params = context_params;
+
+        unsafe extern "C" fn dispatch<F>(
+            t: *mut ffi::ggml_tensor,
+            ask: bool,
+            user_data: *mut c_void,
+        ) -> bool
+        where F: FnMut(*mut ffi::ggml_tensor, bool) -> bool {
+            let callback = &mut *(user_data.cast::<F>());
+            callback(t, ask)
+        }
+        context_params.cb_eval = Some(dispatch::<F>);
+        context_params.cb_eval_user_data = ptr::addr_of_mut!(*callback).cast::<c_void>();
+
+        Self::with_model(model, context_params)
+    }
+
+
     pub fn as_ptr(&self) -> *mut ffi::llama_context {
         self.ptr.as_ptr()
     }
@@ -195,6 +232,12 @@ impl<'a> LlamaContext<'a> {
     pub fn n_ctx(&self) -> usize {
         unsafe {
             ffi::llama_n_ctx(self.as_ptr()).try_into().unwrap()
+        }
+    }
+
+    pub fn n_batch(&self) -> usize {
+        unsafe {
+            ffi::llama_n_batch(self.as_ptr()).try_into().unwrap()
         }
     }
 
