@@ -35,8 +35,7 @@ struct CompletionRequest<'a> {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct BatchCompletionRequest<'a> {
-    #[serde(flatten)]
-    c: CompletionRequest<'a>,
+    prompt: Cow<'a, str>,
     batch_size: usize,
 }
 
@@ -181,7 +180,7 @@ impl<'a, 'b> ServerContext<'a, 'b> {
         req: &BatchCompletionRequest,
     ) -> Result<(), String> {
         // Tokenize and process the prompt.
-        let tokens = self.tokenize(&req.c.prompt)?;
+        let tokens = self.tokenize(&req.prompt)?;
         let batch = batch_with_tokens(&tokens, /* start_pos: */ 0, /* seq_id: */ 0);
         self.ctx.decode(&batch)?;
         drop(batch);
