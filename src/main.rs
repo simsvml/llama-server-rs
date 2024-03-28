@@ -853,29 +853,38 @@ fn main() -> io::Result<()> {
 
     let mut line_buf = String::new();
     for socket in listener.incoming() {
-        let mut socket = socket?;
-        // NB: We assume the client is non-malicious.  A malicious client can exhaust all memory by
-        // sending a large amount of data with no '\n'.
-        line_buf.clear();
-        BufReader::new(&mut socket).read_line(&mut line_buf)?;
+        let socket = socket?;
+        let mut socket_recv = BufReader::new(socket.try_clone()?);
+        let mut socket_send = socket;
+        loop {
+            // NB: We assume the client is non-malicious.  A malicious client can exhaust all
+            // memory by sending a large amount of data with no '\n'.
+            line_buf.clear();
+            let n = socket_recv.read_line(&mut line_buf)?;
+            if n == 0 {
+                // Client disconnected
+                break;
+            }
 
-        let req = match serde_json::from_str::<Request>(&line_buf) {
-            Ok(x) => x,
-            Err(e) => {
-                send_response(&mut socket, &ErrorResponse {
-                    msg: format!("bad request: {}", e).into(),
-                }.into());
-                continue;
-            },
-        };
-        eprintln!("request: {:?}", req);
+            let req = match serde_json::from_str::<Request>(&line_buf) {
+                Ok(x) => x,
+                Err(e) => {
+                    send_response(&mut socket_send, &ErrorResponse {
+                        msg: format!("bad request: {}", e).into(),
+                    }.into());
+                    break;
+                },
+            };
+            eprintln!("request: {:?}", req);
 
-        let result = scx.handle_request(&mut socket, &req);
-        match result {
-            Ok(()) => {},
-            Err(msg) => {
-                send_response(&mut socket, &ErrorResponse { msg: msg.into() }.into());
-            },
+            let result = scx.handle_request(&mut socket_send, &req);
+            match result {
+                Ok(()) => {},
+                Err(msg) => {
+                    send_response(&mut socket_send, &ErrorResponse { msg: msg.into() }.into());
+                    break;
+                },
+            }
         }
     }
 
