@@ -140,18 +140,23 @@ impl LlamaModel {
         Ok(s)
     }
 
-    pub fn token_to_piece(
+    /// Convert a token ID to bytes, appending the bytes to `buf`.  Returns a slice of `buf`
+    /// containing the new bytes.
+    pub fn token_to_piece<'a>(
         &self,
         token: ffi::llama_token,
-        buf: &mut Vec<u8>,
-    ) -> usize {
+        buf: &'a mut Vec<u8>,
+    ) -> &'a [u8] {
+        let old_len = buf.len();
         match self.try_token_to_piece(token, buf) {
-            Ok(n) => return n,
+            Ok(_) => {},
             Err(need) => {
                 buf.reserve(need);
-                self.try_token_to_piece(token, buf).unwrap()
+                self.try_token_to_piece(token, buf).unwrap();
             },
         }
+        let new_len = buf.len();
+        &buf[old_len..new_len]
     }
 
     pub fn token_to_piece_str<'a>(

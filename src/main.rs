@@ -87,7 +87,7 @@ struct CompletionResponse<'a> {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct BatchCompletionResponse<'a> {
-    content: Cow<'a, [String]>,
+    content: Cow<'a, [Cow<'a, str>]>,
 }
 
 /// Response header giving hidden state vectors for a set of prompts.  The JSON response header is
@@ -252,18 +252,15 @@ impl<'a, 'b> ServerContext<'a, 'b> {
 
         // Sampling
         let mut token_data = self.empty_token_data();
-        let mut token_buf = Vec::with_capacity(64);
-        let mut content = String::new();
+        let mut content = Vec::with_capacity(5 * req.n_predict);
         let mut batch = LlamaBatch::new(1, 1);
         for offset in 0 .. req.n_predict {
             let pos = tokens.len() + offset;
             let logits_index = if offset == 0 { tokens.len() - 1 } else { 0 };
 
             let token = self.sample_token(logits_index, &mut token_data);
-            let token_str = self.token_to_str(token, &mut token_buf)?;
-
-            eprint!("{}", token_str);
-            content.push_str(token_str);
+            let token_bytes = self.model.token_to_piece(token, &mut content);
+            eprint!("{}", String::from_utf8_lossy(token_bytes));
 
             // TODO: Stop on EOS token
 
@@ -279,6 +276,7 @@ impl<'a, 'b> ServerContext<'a, 'b> {
         eprintln!("completed {} tokens in {:?}, {:.2} T/s",
             req.n_predict, dur, req.n_predict as f32 / dur.as_secs_f32());
 
+        let content = String::from_utf8_lossy(&content);
         send_response(socket, &CompletionResponse {
             content: content.into(),
         }.into());
@@ -325,8 +323,9 @@ impl<'a, 'b> ServerContext<'a, 'b> {
 
         // Sampling
         let mut token_data = self.empty_token_data();
-        let mut token_buf = Vec::with_capacity(64);
-        let mut content = (0 .. req.batch_size).map(|_| String::new()).collect::<Vec<_>>();
+        let mut content = (0 .. req.batch_size)
+            .map(|_| Vec::with_capacity(5 * req.n_predict))
+            .collect::<Vec<_>>();
         let mut batch = LlamaBatch::new(req.batch_size, req.batch_size);
         for offset in 0 .. req.n_predict {
             let pos = tokens.len() + offset;
@@ -340,16 +339,14 @@ impl<'a, 'b> ServerContext<'a, 'b> {
                 for (i, s) in content.iter_mut().enumerate() {
                     // TODO: Reuse the same final token_data for each `llama_sample_token` call.
                     let token = self.sample_token(tokens.len() - 1, &mut token_data);
-                    let token_str = self.token_to_str(token, &mut token_buf)?;
-                    s.push_str(token_str);
+                    self.model.token_to_piece(token, s);
                     batch.push(token, pos, /* seq_id: */ i, /* logits: */ true);
                 }
             } else {
                 // Afterward, we get separate logits for each completion in the batch.
                 for (i, s) in content.iter_mut().enumerate() {
                     let token = self.sample_token(i, &mut token_data);
-                    let token_str = self.token_to_str(token, &mut token_buf)?;
-                    s.push_str(token_str);
+                    self.model.token_to_piece(token, s);
                     batch.push(token, pos, /* seq_id: */ i, /* logits: */ true);
                 }
             }
@@ -360,6 +357,8 @@ impl<'a, 'b> ServerContext<'a, 'b> {
             // Process the newly added tokens.
             self.ctx.decode(&batch)?;
         }
+
+        let content = content.iter().map(|b| String::from_utf8_lossy(b)).collect::<Vec<_>>();
 
         eprintln!("{} completions:", req.batch_size);
         for s in &content {
@@ -666,18 +665,6 @@ impl<'a, 'b> ServerContext<'a, 'b> {
         self.ctx.sample_softmax(&mut candidates);
         let token = self.ctx.sample_token(&mut candidates);
         token
-    }
-
-    /// Convert `token` to a string.  Uses `str_buf` as scratch space.
-    fn token_to_str<'s>(
-        &self,
-        token: LlamaToken,
-        str_buf: &'s mut Vec<u8>,
-    ) -> Result<&'s str, String> {
-        str_buf.clear();
-        let token_str = self.model.token_to_piece_str(token, str_buf)
-            .map_err(|e| format!("bad utf8 in model output: {}", e))?;
-        Ok(token_str)
     }
 
     fn update_control_vectors(
