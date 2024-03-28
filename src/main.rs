@@ -48,7 +48,7 @@ struct BatchCompletionRequest<'a> {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct HiddenStatesRequest<'a> {
-    prompts: Cow<'a, [String]>,
+    prompts: Cow<'a, [Cow<'a, str>]>,
 }
 
 
@@ -477,7 +477,7 @@ impl<'a, 'b> ServerContext<'a, 'b> {
                 let token_prompt_iter =
                     state.token_prompt_map.range(ubatch_start .. ubatch_end)
                         .enumerate();
-                for (i, (&token_idx, &prompt_idx)) in token_prompt_iter {
+                for (i, (&token_idx, _)) in token_prompt_iter {
                     let input_idx = token_idx - ubatch_start;
                     let input_byte_offset = usize::try_from((*t).nb[1]).unwrap() * input_idx;
                     debug_assert_eq!(input_byte_offset % mem::size_of::<Element>(), 0);
@@ -586,10 +586,8 @@ impl<'a, 'b> ServerContext<'a, 'b> {
             ctx.decode(&batch)?;
         }
 
-        // Drop everything that borrows `socket` so we can send a final message with it.
+        // Drop `ctx`, which (indirectly) borrows `socket`, so we can send a final message.
         drop(ctx);
-        drop(callback);
-        drop(cb_state);
 
         try_send_message(&mut socket, &HiddenStatesStreamingResponse::Done)?;
         Ok(())
