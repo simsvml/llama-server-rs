@@ -27,6 +27,7 @@ fn main() {
         .whitelist_type("llama_model_params")
         .whitelist_function("llama_.*")
         .whitelist_function("ggml_.*")
+        .whitelist_function("gguf_.*")
 
         //.blacklist_function("llama_dump_timing_info_yaml")
         //.blacklist_type("FILE")

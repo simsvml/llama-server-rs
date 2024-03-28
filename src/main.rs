@@ -1,12 +1,14 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::{self, BufReader, BufRead, Write, BufWriter};
 use std::mem;
 use std::os::raw::c_void;
 use std::os::unix::net::UnixListener;
 use std::path::Path;
+use std::ptr;
 use std::slice;
 use std::str;
 use clap::{Command, Arg, ArgMatches, value_parser};
@@ -38,11 +40,22 @@ enum Request<'a> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CompletionRequest<'a> {
     prompt: Cow<'a, str>,
+    control_vectors: Option<Cow<'a, [ControlVector<'a>]>>,
+}
+
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+struct ControlVector<'a> {
+    #[serde(alias = "fname")]
+    name: Cow<'a, str>,
+    strength: f32,
+    layer_start: Option<usize>,
+    layer_end: Option<usize>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct BatchCompletionRequest<'a> {
     prompt: Cow<'a, str>,
+    control_vectors: Option<Cow<'a, [ControlVector<'a>]>>,
     batch_size: usize,
 }
 
@@ -182,6 +195,8 @@ fn send_response(socket: impl Write, resp: &Response) {
 struct ServerContext<'a, 'b> {
     model: &'a LlamaModel,
     ctx: &'b mut LlamaContext<'a>,
+    /// The set of control vectors that are currently loaded into `ctx`.
+    loaded_control_vectors: Vec<ControlVector<'static>>,
 }
 
 impl<'a, 'b> ServerContext<'a, 'b> {
@@ -189,7 +204,10 @@ impl<'a, 'b> ServerContext<'a, 'b> {
         model: &'a LlamaModel,
         ctx: &'b mut LlamaContext<'a>,
     ) -> ServerContext<'a, 'b> {
-        ServerContext { model, ctx }
+        ServerContext {
+            model, ctx,
+            loaded_control_vectors: Vec::new(),
+        }
     }
 
     fn handle_request(
@@ -213,6 +231,10 @@ impl<'a, 'b> ServerContext<'a, 'b> {
         req: &CompletionRequest,
     ) -> Result<(), String> {
         self.ctx.kv_cache_clear();
+
+        if let Some(ref control_vectors) = req.control_vectors {
+            self.update_control_vectors(control_vectors)?;
+        }
 
         // Tokenize and process the prompt.
         let tokens = self.tokenize(&req.prompt)?;
@@ -258,6 +280,10 @@ impl<'a, 'b> ServerContext<'a, 'b> {
         req: &BatchCompletionRequest,
     ) -> Result<(), String> {
         self.ctx.kv_cache_clear();
+
+        if let Some(ref control_vectors) = req.control_vectors {
+            self.update_control_vectors(control_vectors)?;
+        }
 
         // Tokenize and process the prompt.
         let tokens = self.tokenize(&req.prompt)?;
@@ -640,6 +666,130 @@ impl<'a, 'b> ServerContext<'a, 'b> {
         let token_str = self.model.token_to_piece_str(token, str_buf)
             .map_err(|e| format!("bad utf8 in model output: {}", e))?;
         Ok(token_str)
+    }
+
+    fn update_control_vectors(
+        &mut self,
+        control_vectors: &[ControlVector],
+    ) -> Result<(), String> {
+        if self.loaded_control_vectors == control_vectors {
+            return Ok(());
+        }
+
+        let n_embd = self.model.n_embd();
+
+        if control_vectors.len() == 0 {
+            unsafe {
+                let r = ffi::llama_control_vector_apply(
+                    self.ctx.as_ptr(),
+                    ptr::null_mut(),
+                    0,
+                    n_embd.try_into().unwrap(),
+                    -1,
+                    -1,
+                );
+                assert_eq!(r, 0);
+            }
+        } else {
+            let data = self.load_control_vectors(control_vectors)?;
+
+            // Skip the data for the first layer.  `llama_control_vector_apply` only wants data for
+            // layers 1 and up.
+            let data = &data[n_embd ..];
+
+            unsafe {
+                let r = ffi::llama_control_vector_apply(
+                    self.ctx.as_ptr(),
+                    data.as_ptr(),
+                    data.len().try_into().unwrap(),
+                    n_embd.try_into().unwrap(),
+                    1,
+                    self.model.n_layer().try_into().unwrap(),
+                );
+                assert_eq!(r, 0);
+            }
+        }
+
+        self.loaded_control_vectors = control_vectors.iter().map(|cv| {
+            let ControlVector { ref name, strength, layer_start, layer_end } = *cv;
+            let name = String::from(&**name).into();
+            ControlVector { name, strength, layer_start, layer_end }
+        }).collect();
+        Ok(())
+    }
+
+    /// Load control vector data as specified in `control_vectors`.  Returns a vector containing
+    /// `n_layer * n_embd` values.
+    fn load_control_vectors(
+        &self,
+        control_vectors: &[ControlVector],
+    ) -> Result<Vec<f32>, String> {
+        // TODO: Restrict file paths for security against untrusted clients
+
+        let mut data = vec![0.; self.model.n_layer() * self.model.n_embd()];
+        let n_layer = self.model.n_layer();
+        let n_embd = self.model.n_embd();
+        let n_embd_tensor_dim = n_embd.try_into().unwrap();
+        for cv in control_vectors {
+            unsafe {
+                let path_cstr = CString::new(&*cv.name)
+                    .map_err(|e| format!("bad path {:?}: {}", cv.name, e))?;
+                let mut ggml_ctx = ptr::null_mut();
+                let gguf = ffi::gguf_init_from_file(path_cstr.as_ptr(), ffi::gguf_init_params {
+                    no_alloc: false,
+                    ctx: &mut ggml_ctx,
+                });
+                if gguf.is_null() {
+                    return Err(format!("failed to parse {:?} as gguf", cv.name));
+                }
+
+                let n_tensors = ffi::gguf_get_n_tensors(gguf);
+                assert!(n_tensors >= 0);
+
+                let layer_start = cv.layer_start.unwrap_or(0);
+                let layer_end = cv.layer_end.unwrap_or(n_layer);
+                let mut found_tensors = false;
+                for layer in layer_start .. layer_end {
+                    let tensor_name = format!("direction.{}\0", layer);
+                    let tensor_name_cstr =
+                        CStr::from_bytes_with_nul(tensor_name.as_bytes()).unwrap();
+                    let tensor = ffi::ggml_get_tensor(ggml_ctx, tensor_name_cstr.as_ptr());
+                    if tensor.is_null() {
+                        continue;
+                    }
+                    found_tensors = true;
+
+                    // Check tensor format
+                    if (*tensor).type_ != ffi::ggml_type_GGML_TYPE_F32 {
+                        return Err(format!("bad type {} for tensor {} of {:?}",
+                                (*tensor).type_, tensor_name, cv.name));
+                    }
+                    if (*tensor).ne != [n_embd_tensor_dim, 1, 1, 1] {
+                        return Err(format!(
+                            "bad dimensions {:?} for tensor {} of {:?} (n_embd = {})",
+                            (*tensor).ne, tensor_name, cv.name, n_embd,
+                        ));
+                    }
+
+                    let tensor_data = slice::from_raw_parts(
+                        (*tensor).data.cast::<f32>(),
+                        n_embd,
+                    );
+                    let layer_data_offset = layer * n_embd;
+                    let layer_data = &mut data[layer_data_offset .. layer_data_offset + n_embd];
+                    for (&src, dest) in tensor_data.iter().zip(layer_data.iter_mut()) {
+                        *dest += src * cv.strength;
+                    }
+                }
+
+                if !found_tensors {
+                    return Err(format!("found no tensors in layer range {} .. {} of {:?}",
+                        layer_start, layer_end, cv.name));
+                }
+            }
+        }
+
+        Ok(data)
     }
 }
 
