@@ -236,6 +236,8 @@ impl<'a, 'b> ServerContext<'a, 'b> {
         socket: impl Write,
         req: &CompletionRequest,
     ) -> Result<(), String> {
+        let start = std::time::Instant::now();
+
         self.ctx.kv_cache_clear();
 
         if let Some(ref control_vectors) = req.control_vectors {
@@ -272,6 +274,10 @@ impl<'a, 'b> ServerContext<'a, 'b> {
             self.ctx.decode(&batch)?;
         }
         eprintln!();
+
+        let dur = start.elapsed();
+        eprintln!("completed {} tokens in {:?}, {:.2} T/s",
+            req.n_predict, dur, req.n_predict as f32 / dur.as_secs_f32());
 
         send_response(socket, &CompletionResponse {
             content: content.into(),
