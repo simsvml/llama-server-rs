@@ -1,10 +1,12 @@
 import argparse
 import gguf
-import json
 import numpy as np
 from sklearn.decomposition import PCA
 import socket
 import sys
+
+from client import Client
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -128,51 +130,6 @@ def export_gguf(directions, path: str):
 ########################################
 
 
-def try_index(haystack, needle):
-    try:
-        return haystack.index(needle)
-    except ValueError:
-        return None
-
-class SocketReceiver:
-    def __init__(self, socket):
-        self.socket = socket
-        self.buf = bytearray()
-
-    def recv_json(self):
-        '''Receive a newline-terminated JSON object from the socket.'''
-        idx = try_index(self.buf, b'\n')
-        while idx is None:
-            chunk = self.socket.recv(4096)
-            if len(chunk) == 0:
-                raise ValueError('socket closed')
-            idx = try_index(chunk, b'\n')
-            if idx is not None:
-                idx += len(self.buf)
-            self.buf.extend(chunk)
-        j = json.loads(self.buf[:idx].decode('utf-8'))
-        # Delete the JSON part and the trailing '\n'
-        del self.buf[: idx + 1]
-        return j
-
-    def recv_bytes_into(self, dest):
-        '''Receive bytes into the buffer object `dest`.  This will keep going
-        until the buffer is full.'''
-        mv = memoryview(dest).cast('B')
-
-        copy_amount = min(len(self.buf), len(mv))
-        if copy_amount > 0:
-            mv[:copy_amount] = self.buf[:copy_amount]
-            del self.buf[:copy_amount]
-            mv = mv[copy_amount:]
-
-        while len(mv) > 0:
-            n = self.socket.recv_into(mv)
-            if n == 0:
-                raise ValueError('socket closed')
-            mv = mv[n:]
-
-
 def main():
     args = parse_args()
 
@@ -181,45 +138,13 @@ def main():
 
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
         s.connect('./llama.socket')
-        msg = json.dumps({
+
+        c = Client(s)
+        c.send_json({
             'kind': 'hidden_states',
             'prompts': prompts,
         })
-        s.send(msg.encode('utf-8') + b'\n')
-
-        r = SocketReceiver(s)
-        resp1 = r.recv_json()
-        assert resp1.get('kind') == 'hidden_states', \
-                'unexpected response from server: %r' % (resp1,)
-
-        n_prompt = resp1['n_prompt']
-        n_layer = resp1['n_layer']
-        n_embd = resp1['n_embd']
-
-        hidden_states = {i: np.empty((n_prompt, n_embd), dtype=np.float32)
-            for i in range(n_layer)}
-
-        progress = 0
-        progress_max = n_layer * n_prompt
-        last_reported_progress = 0
-
-        while True:
-            resp = r.recv_json()
-            if 'kind' not in resp:
-                # This is a chunk header, which is sent in abbreviated form.
-                layer = resp['l']
-                prompt_idxs = resp['p']
-                layer_hidden_states = hidden_states[layer]
-                for prompt_idx in prompt_idxs:
-                    r.recv_bytes_into(layer_hidden_states[prompt_idx])
-                progress += len(prompt_idxs)
-                if progress >= last_reported_progress + 1000 or progress == progress_max:
-                    print('receiving hidden states: %d/%d' % (progress, progress_max))
-                    last_reported_progress = progress
-            else:
-                assert resp.get('kind') == 'done', \
-                        'unexpected response from server: %r' % (resp,)
-                break
+        hidden_states = c.recv_hidden_states()
 
         layer_vectors = read_representations(hidden_states)
 
