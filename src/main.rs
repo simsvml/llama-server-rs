@@ -40,6 +40,8 @@ enum Request<'a> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CompletionRequest<'a> {
     prompt: Cow<'a, str>,
+    #[serde(default = "const_usize::<128>")]
+    n_predict: usize,
     control_vectors: Option<Cow<'a, [ControlVector<'a>]>>,
 }
 
@@ -55,6 +57,8 @@ struct ControlVector<'a> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct BatchCompletionRequest<'a> {
     prompt: Cow<'a, str>,
+    #[serde(default = "const_usize::<128>")]
+    n_predict: usize,
     control_vectors: Option<Cow<'a, [ControlVector<'a>]>>,
     batch_size: usize,
 }
@@ -63,6 +67,8 @@ struct BatchCompletionRequest<'a> {
 struct HiddenStatesRequest<'a> {
     prompts: Cow<'a, [Cow<'a, str>]>,
 }
+
+fn const_usize<const N: usize>() -> usize { N }
 
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -247,7 +253,7 @@ impl<'a, 'b> ServerContext<'a, 'b> {
         let mut token_buf = Vec::with_capacity(64);
         let mut content = String::new();
         let mut batch = LlamaBatch::new(1, 1);
-        for offset in 0 .. 128 {
+        for offset in 0 .. req.n_predict {
             let pos = tokens.len() + offset;
             let logits_index = if offset == 0 { tokens.len() - 1 } else { 0 };
 
@@ -316,7 +322,7 @@ impl<'a, 'b> ServerContext<'a, 'b> {
         let mut token_buf = Vec::with_capacity(64);
         let mut content = (0 .. req.batch_size).map(|_| String::new()).collect::<Vec<_>>();
         let mut batch = LlamaBatch::new(req.batch_size, req.batch_size);
-        for offset in 0 .. 32 {
+        for offset in 0 .. req.n_predict {
             let pos = tokens.len() + offset;
 
             batch.clear();
