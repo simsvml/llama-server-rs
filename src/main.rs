@@ -585,6 +585,9 @@ impl<'a, 'b> ServerContext<'a, 'b> {
             batch.clear();
 
             let mut cb_state_access = cb_state.borrow_mut();
+            if let Some(err) = cb_state_access.error.take() {
+                return Err(err);
+            }
             cb_state_access.tokens_seen.fill(0);
             cb_state_access.token_prompt_map.clear();
 
