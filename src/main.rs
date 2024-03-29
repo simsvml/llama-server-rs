@@ -42,7 +42,24 @@ struct CompletionRequest<'a> {
     prompt: Cow<'a, str>,
     #[serde(default = "const_usize::<128>")]
     n_predict: usize,
+    samplers: Cow<'a, [Sampler]>,
     control_vectors: Option<Cow<'a, [ControlVector<'a>]>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct BatchCompletionRequest<'a> {
+    prompt: Cow<'a, str>,
+    #[serde(default = "const_usize::<128>")]
+    n_predict: usize,
+    samplers: Cow<'a, [Sampler]>,
+    control_vectors: Option<Cow<'a, [ControlVector<'a>]>>,
+    batch_size: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct HiddenStatesRequest<'a> {
+    prompts: Cow<'a, [Cow<'a, str>]>,
+    samplers: Cow<'a, [Sampler]>,
 }
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -54,18 +71,10 @@ struct ControlVector<'a> {
     layer_end: Option<usize>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct BatchCompletionRequest<'a> {
-    prompt: Cow<'a, str>,
-    #[serde(default = "const_usize::<128>")]
-    n_predict: usize,
-    control_vectors: Option<Cow<'a, [ControlVector<'a>]>>,
-    batch_size: usize,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct HiddenStatesRequest<'a> {
-    prompts: Cow<'a, [Cow<'a, str>]>,
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Sampler {
+    Temp(f32),
 }
 
 fn const_usize<const N: usize>() -> usize { N }
@@ -258,7 +267,7 @@ impl<'a, 'b> ServerContext<'a, 'b> {
             let pos = tokens.len() + offset;
             let logits_index = if offset == 0 { tokens.len() - 1 } else { 0 };
 
-            let token = self.sample_token(logits_index, &mut token_data);
+            let token = self.sample_token(&req.samplers, logits_index, &mut token_data);
             let token_bytes = self.model.token_to_piece(token, &mut content);
             eprint!("{}", String::from_utf8_lossy(token_bytes));
 
@@ -338,14 +347,16 @@ impl<'a, 'b> ServerContext<'a, 'b> {
                 // last prompt token.
                 for (i, s) in content.iter_mut().enumerate() {
                     // TODO: Reuse the same final token_data for each `llama_sample_token` call.
-                    let token = self.sample_token(tokens.len() - 1, &mut token_data);
+                    let token = self.sample_token(
+                        &req.samplers, tokens.len() - 1, &mut token_data);
                     self.model.token_to_piece(token, s);
                     batch.push(token, pos, /* seq_id: */ i, /* logits: */ true);
                 }
             } else {
                 // Afterward, we get separate logits for each completion in the batch.
                 for (i, s) in content.iter_mut().enumerate() {
-                    let token = self.sample_token(i, &mut token_data);
+                    let token = self.sample_token(
+                        &req.samplers, i, &mut token_data);
                     self.model.token_to_piece(token, s);
                     batch.push(token, pos, /* seq_id: */ i, /* logits: */ true);
                 }
@@ -649,7 +660,12 @@ impl<'a, 'b> ServerContext<'a, 'b> {
 
     /// Sample the next token based on the logits for `token_idx` from the last batch.  Uses `buf`
     /// as scratch space; it must have length equal to `n_vocab`.
-    fn sample_token(&self, token_idx: usize, buf: &mut [LlamaTokenData]) -> LlamaToken {
+    fn sample_token(
+        &self,
+        samplers: &[Sampler],
+        token_idx: usize,
+        buf: &mut [LlamaTokenData],
+    ) -> LlamaToken {
         debug_assert_eq!(buf.len(), self.model.n_vocab());
 
         let logits = self.ctx.logits_ith(token_idx);
@@ -666,6 +682,11 @@ impl<'a, 'b> ServerContext<'a, 'b> {
         let mut candidates = LlamaTokenDataArray::new(buf);
 
         self.ctx.sample_softmax(&mut candidates);
+        for sampler in samplers {
+            match *sampler {
+                Sampler::Temp(temp) => self.ctx.sample_temp(&mut candidates, temp),
+            }
+        }
         let token = self.ctx.sample_token(&mut candidates);
         token
     }

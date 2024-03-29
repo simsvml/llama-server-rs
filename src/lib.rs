@@ -301,6 +301,12 @@ impl<'a> LlamaContext<'a> {
         }
     }
 
+    pub fn sample_temp(&self, candidates: &mut LlamaTokenDataArray, temp: f32) {
+        unsafe {
+            ffi::llama_sample_temp(self.as_ptr(), candidates.as_mut_ptr(), temp)
+        }
+    }
+
     pub fn sample_token(&self, candidates: &mut LlamaTokenDataArray) -> ffi::llama_token {
         unsafe {
             ffi::llama_sample_token(self.as_ptr(), candidates.as_mut_ptr())
@@ -425,7 +431,7 @@ impl Deref for LlamaTokenDataArray<'_> {
     fn deref(&self) -> &[LlamaTokenData] {
         unsafe {
             // This is safe because `data` and `size` are initially set by deconstructing a slice,
-            // and none of the llama.cpp methods we use modify those fields.
+            // and the llama.cpp methods we use don't modify `data` or increase `size`.
             slice::from_raw_parts(
                 self.raw.data,
                 self.raw.size as usize,
@@ -438,7 +444,7 @@ impl DerefMut for LlamaTokenDataArray<'_> {
     fn deref_mut(&mut self) -> &mut [LlamaTokenData] {
         unsafe {
             // This is safe because `data` and `size` are initially set by deconstructing a slice,
-            // and none of the llama.cpp methods we use modify those fields.
+            // and the llama.cpp methods we use don't modify `data` or increase `size`.
             slice::from_raw_parts_mut(
                 self.raw.data,
                 self.raw.size as usize,
