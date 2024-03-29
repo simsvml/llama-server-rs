@@ -130,6 +130,23 @@ def export_gguf(directions, path: str):
 ########################################
 
 
+def calc_mean_difference(
+    layer_hiddens: dict[int, np.ndarray],
+) -> dict[int, np.ndarray]:
+    '''Compute the mean difference within each prompt pair.'''
+
+    hidden_layers = sorted(layer_hiddens.keys())
+    num_inputs = next(iter(layer_hiddens.values())).shape[0] // 2
+    print('%d inputs' % num_inputs)
+
+    out = {}
+    for layer, hiddens in layer_hiddens.items():
+        deltas = hiddens[::2] - hiddens[1::2]
+        out[layer] = deltas.mean(axis = 0)
+
+    return out
+
+
 def main():
     args = parse_args()
 
