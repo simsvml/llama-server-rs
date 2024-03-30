@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::fs;
 use std::io::{self, BufReader, BufRead, Write, BufWriter};
 use std::mem;
@@ -16,7 +16,7 @@ use serde::{Serialize, Deserialize};
 use serde_json;
 use llama_server_rs::{
     LlamaModel, default_model_params, LlamaContext, default_context_params, LlamaBatch, LlamaToken,
-    LlamaTokenData, LlamaTokenDataArray,
+    LlamaTokenData, LlamaTokenDataArray, Gguf, GgufInitParams,
 };
 use llama_server_rs::sequence_trie::{SequenceTrie, TrieNodeId};
 use llama_server_rs::ffi as ffi;
@@ -790,19 +790,12 @@ impl<'a, 'b> ServerContext<'a, 'b> {
         let n_embd_tensor_dim = n_embd.try_into().unwrap();
         for cv in control_vectors {
             unsafe {
-                let path_cstr = CString::new(&*cv.name)
-                    .map_err(|e| format!("bad path {:?}: {}", cv.name, e))?;
-                let mut ggml_ctx = ptr::null_mut();
-                let gguf = ffi::gguf_init_from_file(path_cstr.as_ptr(), ffi::gguf_init_params {
-                    no_alloc: false,
-                    ctx: &mut ggml_ctx,
-                });
-                if gguf.is_null() {
-                    return Err(format!("failed to parse {:?} as gguf", cv.name));
-                }
+                let gguf = Gguf::init_from_file(&*cv.name, GgufInitParams::default())
+                    .ok_or_else(|| format!("failed to parse {:?} as gguf", cv.name))?;
 
-                let n_tensors = ffi::gguf_get_n_tensors(gguf);
-                assert!(n_tensors >= 0);
+                if gguf.n_tensors() == 0 {
+                    return Err(format!("gguf file {:?} contains no tensors", cv.name));
+                }
 
                 let layer_start = cv.layer_start.unwrap_or(0);
                 let layer_end = cv.layer_end.unwrap_or(n_layer);
@@ -811,7 +804,8 @@ impl<'a, 'b> ServerContext<'a, 'b> {
                     let tensor_name = format!("direction.{}\0", layer);
                     let tensor_name_cstr =
                         CStr::from_bytes_with_nul(tensor_name.as_bytes()).unwrap();
-                    let tensor = ffi::ggml_get_tensor(ggml_ctx, tensor_name_cstr.as_ptr());
+                    let tensor = ffi::ggml_get_tensor(
+                        gguf.ggml_context_as_ptr(), tensor_name_cstr.as_ptr());
                     if tensor.is_null() {
                         continue;
                     }

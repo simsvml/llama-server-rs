@@ -491,6 +491,84 @@ impl DerefMut for LlamaTokenDataArray<'_> {
 }
 
 
+pub struct Gguf {
+    gguf_ctx: NonNull<ffi::gguf_context>,
+    /// Pointer to the GGML context associated with this GGUF.  This will be null if no context was
+    /// requested (`init_params.make_context == false`).
+    ggml_ctx: *mut ffi::ggml_context,
+}
+
+#[derive(Clone, Debug)]
+pub struct GgufInitParams {
+    pub no_alloc: bool,
+    pub make_context: bool,
+}
+
+impl Default for GgufInitParams {
+    fn default() -> GgufInitParams {
+        GgufInitParams {
+            no_alloc: false,
+            make_context: true,
+        }
+    }
+}
+
+impl Gguf {
+    pub fn init_from_file(
+        path: impl Into<Vec<u8>>,
+        init_params: GgufInitParams,
+    ) -> Option<Gguf> {
+        unsafe {
+            let mut ggml_ctx = ptr::null_mut();
+            let params = ffi::gguf_init_params {
+                no_alloc: init_params.no_alloc,
+                ctx: if init_params.make_context {
+                    &mut ggml_ctx
+                } else {
+                    ptr::null_mut()
+                },
+            };
+            let name = CString::new(path).ok()?;
+            let gguf_ctx = ffi::gguf_init_from_file(name.as_ptr(), params);
+            let gguf_ctx = NonNull::new(gguf_ctx)?;
+
+            // Build the `Gguf` object so its destructor will run if later checks fail.
+            let gguf = Gguf { gguf_ctx, ggml_ctx };
+
+            if init_params.make_context && ggml_ctx.is_null() {
+                return None;
+            }
+            Some(gguf)
+        }
+    }
+
+    pub fn as_ptr(&self) -> *mut ffi::gguf_context {
+        self.gguf_ctx.as_ptr()
+    }
+
+    pub fn ggml_context_as_ptr(&self) -> *mut ffi::ggml_context {
+        self.ggml_ctx
+    }
+
+    pub fn n_tensors(&self) -> usize {
+        unsafe {
+            ffi::gguf_get_n_tensors(self.as_ptr()).try_into().unwrap()
+        }
+    }
+}
+
+impl Drop for Gguf {
+    fn drop(&mut self) {
+        unsafe {
+            ffi::gguf_free(self.gguf_ctx.as_ptr());
+            if !self.ggml_ctx.is_null() {
+                ffi::ggml_free(self.ggml_ctx);
+            }
+        }
+    }
+}
+
+
 pub fn default_model_params() -> ffi::llama_model_params {
     unsafe { ffi::llama_model_default_params() }
 }
