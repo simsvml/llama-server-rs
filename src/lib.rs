@@ -7,6 +7,9 @@ use std::slice;
 use std::str::{self, Utf8Error};
 
 
+pub mod sequence_trie;
+
+
 pub mod ffi {
     #![allow(non_upper_case_globals)]
     #![allow(non_camel_case_types)]
@@ -344,6 +347,7 @@ impl<'a> Drop for LlamaContext<'a> {
 pub struct LlamaBatch {
     batch: ffi::llama_batch,
     capacity: usize,
+    n_seq_max: usize,
 }
 
 impl LlamaBatch {
@@ -357,6 +361,7 @@ impl LlamaBatch {
             LlamaBatch {
                 batch,
                 capacity: n_tokens,
+                n_seq_max,
             }
         }
     }
@@ -391,6 +396,20 @@ impl LlamaBatch {
             *self.batch.logits.add(i) = logits as i8;
 
             self.batch.n_tokens += 1;
+        }
+    }
+
+    pub fn add_seq_to_token(&mut self, token_idx: usize, seq_id: usize) {
+        let i = token_idx;
+        unsafe {
+            assert!(i < self.len());
+            let n_seq_id_ptr = self.batch.n_seq_id.add(i);
+            let seq_id_ptr = *self.batch.seq_id.add(i);
+
+            let n_seq_id = usize::try_from(*n_seq_id_ptr).unwrap();
+            assert!(n_seq_id < self.n_seq_max);
+            *seq_id_ptr.add(n_seq_id) = seq_id.try_into().unwrap();
+            *n_seq_id_ptr = (n_seq_id + 1).try_into().unwrap();
         }
     }
 
@@ -512,5 +531,3 @@ pub fn dump_batch(batch: ffi::llama_batch) {
         }
     }
 }
-
-

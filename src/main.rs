@@ -18,6 +18,7 @@ use llama_server_rs::{
     LlamaModel, default_model_params, LlamaContext, default_context_params, LlamaBatch, LlamaToken,
     LlamaTokenData, LlamaTokenDataArray,
 };
+use llama_server_rs::sequence_trie::{SequenceTrie, TrieNodeId};
 use llama_server_rs::ffi as ffi;
 
 fn parse_args() -> ArgMatches {
@@ -599,8 +600,11 @@ impl<'a, 'b> ServerContext<'a, 'b> {
         let mut batch = LlamaBatch::new(ctx.n_batch(), ctx.n_seq_max());
 
         let mut prompt_tokens = prompt_tokens.iter().enumerate().peekable();
+        // Track sequences already in the batch so similar sequences can be reused.
+        let mut seq_trie = SequenceTrie::with_capacity(ctx.n_ctx());
         while prompt_tokens.peek().is_some() {
             batch.clear();
+            seq_trie.clear();
 
             let mut cb_state_access = cb_state.borrow_mut();
             if let Some(err) = cb_state_access.error.take() {
@@ -623,12 +627,33 @@ impl<'a, 'b> ServerContext<'a, 'b> {
                     Some(i) => i,
                     None => break,
                 };
-                if prompt.len() > batch.capacity() - batch.len() {
+
+                // Reuse existing tokens where possible.  If we see "foo bar" and "foo baz" in the
+                // same batch, we process the common prefix "foo" only once.
+                let mut reused = 0;
+                let mut seq_trie_node = TrieNodeId::ROOT;
+                // Never reuse the last token, since we want to ensure its hidden states are
+                // visible to the callback.
+                while reused < prompt.len() - 1 {
+                    let token = prompt[reused];
+                    seq_trie_node = match seq_trie.child(seq_trie_node, token) {
+                        Some(n) => n,
+                        None => break,
+                    };
+                    let token_idx = seq_trie[seq_trie_node];
+                    batch.add_seq_to_token(token_idx, seq_id);
+                    reused += 1;
+                }
+
+                let need = prompt.len() - reused;
+                if need > batch.capacity() - batch.len() {
                     break;
                 }
 
-                for (pos, &token) in prompt.iter().enumerate() {
+                for (pos, &token) in prompt.iter().enumerate().skip(reused) {
                     let logits = pos == prompt.len() - 1;
+                    let token_idx = batch.len();
+                    seq_trie_node = seq_trie.insert(seq_trie_node, token, token_idx);
                     batch.push(token, pos, seq_id, logits);
                 }
                 cb_state_access.token_prompt_map.insert(batch.len() - 1, prompt_idx);
