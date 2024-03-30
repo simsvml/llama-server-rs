@@ -595,7 +595,14 @@ impl<'a, 'b> ServerContext<'a, 'b> {
 
         let mut batch = LlamaBatch::new(ctx.n_batch(), ctx.n_seq_max());
 
-        let mut prompt_tokens = prompt_tokens.iter().enumerate().peekable();
+        // Sort prompts lexicographically.  This ensures that similar prompts are placed close
+        // together when building batches, so their common prefixes can be reused.  We keep the
+        // original index alongside each prompt so each prompt is associated with its `prompt_idx`
+        // from the original, unsorted list.
+        let mut prompt_tokens = prompt_tokens.iter().enumerate().collect::<Vec<_>>();
+        prompt_tokens.sort_by_key(|&(_, ts)| ts);
+        let mut prompt_tokens = prompt_tokens.into_iter().peekable();
+
         // Track sequences already in the batch so similar sequences can be reused.
         let mut seq_trie = SequenceTrie::with_capacity(ctx.n_ctx());
         while prompt_tokens.peek().is_some() {
