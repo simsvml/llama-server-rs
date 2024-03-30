@@ -1,5 +1,6 @@
 import argparse
 import gguf
+import json
 import numpy as np
 from sklearn.decomposition import PCA
 import socket
@@ -11,7 +12,7 @@ from client import Client
 def parse_args():
     parser = argparse.ArgumentParser(
             description='train a control vector from a set of prompts')
-    parser.add_argument('prompts', metavar='PROMPTS.TXT',
+    parser.add_argument('prompts', metavar='PROMPTS.JSON',
             help='file to read the prompts from')
     parser.add_argument('control_vector', metavar='CVEC.GGUF',
             help='where to write the control vector')
@@ -150,8 +151,8 @@ def calc_mean_difference(
 def main():
     args = parse_args()
 
-    prompts = open(args.prompts).read().splitlines()
-    prompts = [p for p in prompts if p != '']
+    prompts = json.load(open(args.prompts))
+    assert isinstance(prompts, list)
 
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
         s.connect('./llama.socket')
