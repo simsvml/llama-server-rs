@@ -260,18 +260,22 @@ impl<'a, 'b> ServerContext<'a, 'b> {
         drop(batch);
 
         // Sampling
+        let eos_token = self.model.token_eos();
         let mut token_data = self.empty_token_data();
         let mut content = Vec::with_capacity(5 * req.n_predict);
         let mut batch = LlamaBatch::new(1, 1);
+        let mut tokens_generated = 0;
         for offset in 0 .. req.n_predict {
             let pos = tokens.len() + offset;
             let logits_index = if offset == 0 { tokens.len() - 1 } else { 0 };
 
             let token = self.sample_token(&req.samplers, logits_index, &mut token_data);
+            tokens_generated += 1;
+            if token == eos_token {
+                break;
+            }
             let token_bytes = self.model.token_to_piece(token, &mut content);
             eprint!("{}", String::from_utf8_lossy(token_bytes));
-
-            // TODO: Stop on EOS token
 
             // Process the newly added token.
             // TODO: Skip this part on the final iteration, since its results aren't used.
@@ -283,7 +287,7 @@ impl<'a, 'b> ServerContext<'a, 'b> {
 
         let dur = start.elapsed();
         eprintln!("completed {} tokens in {:?}, {:.2} T/s",
-            req.n_predict, dur, req.n_predict as f32 / dur.as_secs_f32());
+            tokens_generated, dur, tokens_generated as f32 / dur.as_secs_f32());
 
         let content = String::from_utf8_lossy(&content);
         send_response(socket, &CompletionResponse {

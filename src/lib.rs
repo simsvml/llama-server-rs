@@ -59,6 +59,24 @@ impl LlamaModel {
         }
     }
 
+    pub fn token_bos(&self) -> LlamaToken {
+        unsafe {
+            ffi::llama_token_bos(self.as_ptr())
+        }
+    }
+
+    pub fn token_eos(&self) -> LlamaToken {
+        unsafe {
+            ffi::llama_token_eos(self.as_ptr())
+        }
+    }
+
+    pub fn token_nl(&self) -> LlamaToken {
+        unsafe {
+            ffi::llama_token_nl(self.as_ptr())
+        }
+    }
+
     /// Tokenize `text`, appending the tokens to `tokens`.  This never grows `tokens`; the caller
     /// should ensure it has enough free capacity before the call.  On success, returns `Ok` with
     /// the number of tokens that were added to `tokens`.  On failure (not enough space in
