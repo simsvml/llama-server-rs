@@ -42,6 +42,7 @@ struct CompletionRequest<'a> {
     prompt: Cow<'a, str>,
     #[serde(default = "const_usize::<128>")]
     n_predict: usize,
+    #[serde(default)]
     samplers: Cow<'a, [Sampler]>,
     control_vectors: Option<Cow<'a, [ControlVector<'a>]>>,
 }
@@ -51,6 +52,7 @@ struct BatchCompletionRequest<'a> {
     prompt: Cow<'a, str>,
     #[serde(default = "const_usize::<128>")]
     n_predict: usize,
+    #[serde(default)]
     samplers: Cow<'a, [Sampler]>,
     control_vectors: Option<Cow<'a, [ControlVector<'a>]>>,
     batch_size: usize,
@@ -59,6 +61,7 @@ struct BatchCompletionRequest<'a> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct HiddenStatesRequest<'a> {
     prompts: Cow<'a, [Cow<'a, str>]>,
+    #[serde(default)]
     samplers: Cow<'a, [Sampler]>,
 }
 
