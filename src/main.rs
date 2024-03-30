@@ -45,7 +45,8 @@ struct CompletionRequest<'a> {
     n_predict: usize,
     #[serde(default)]
     samplers: Cow<'a, [Sampler]>,
-    control_vectors: Option<Cow<'a, [ControlVector<'a>]>>,
+    #[serde(default)]
+    control_vectors: Cow<'a, [ControlVector<'a>]>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -55,7 +56,8 @@ struct BatchCompletionRequest<'a> {
     n_predict: usize,
     #[serde(default)]
     samplers: Cow<'a, [Sampler]>,
-    control_vectors: Option<Cow<'a, [ControlVector<'a>]>>,
+    #[serde(default)]
+    control_vectors: Cow<'a, [ControlVector<'a>]>,
     batch_size: usize,
 }
 
@@ -252,10 +254,7 @@ impl<'a, 'b> ServerContext<'a, 'b> {
         let start = std::time::Instant::now();
 
         self.ctx.kv_cache_clear();
-
-        if let Some(ref control_vectors) = req.control_vectors {
-            self.update_control_vectors(control_vectors)?;
-        }
+        self.update_control_vectors(&req.control_vectors)?;
 
         // Tokenize and process the prompt.
         let tokens = self.tokenize(&req.prompt)?;
@@ -307,10 +306,7 @@ impl<'a, 'b> ServerContext<'a, 'b> {
         req: &BatchCompletionRequest,
     ) -> Result<(), String> {
         self.ctx.kv_cache_clear();
-
-        if let Some(ref control_vectors) = req.control_vectors {
-            self.update_control_vectors(control_vectors)?;
-        }
+        self.update_control_vectors(&req.control_vectors)?;
 
         // Tokenize and process the prompt.
         let tokens = self.tokenize(&req.prompt)?;
