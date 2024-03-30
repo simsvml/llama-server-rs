@@ -16,6 +16,8 @@ def parse_args():
             help='file to read the prompts from')
     parser.add_argument('control_vector', metavar='CVEC.GGUF',
             help='where to write the control vector')
+    parser.add_argument('--mode', choices=('pca', 'mean-diff'), default='pca',
+            help='how to compute the control vector from the positive/negative hidden states')
     return parser.parse_args()
 
 
@@ -164,7 +166,12 @@ def main():
         })
         hidden_states = c.recv_hidden_states()
 
-        layer_vectors = read_representations(hidden_states)
+        if args.mode == 'pca':
+            layer_vectors = read_representations(hidden_states)
+        elif args.mode == 'mean-diff':
+            layer_vectors = calc_mean_difference(hidden_states)
+        else:
+            assert False, 'bad args.mode value %r' % (args.mode,)
 
         print('writing gguf to %s' % (args.control_vector,))
         export_gguf(layer_vectors, args.control_vector)
