@@ -81,6 +81,11 @@ struct ControlVector<'a> {
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Sampler {
+    TopK(usize),
+    TopP(f32),
+    MinP(f32),
+    TailFree(f32),
+    Typical(f32),
     Temp(f32),
 }
 
@@ -777,6 +782,11 @@ impl<'a, 'b> ServerContext<'a, 'b> {
         self.ctx.sample_softmax(&mut candidates);
         for sampler in samplers {
             match *sampler {
+                Sampler::TopK(k) => self.ctx.sample_top_k(&mut candidates, k),
+                Sampler::TopP(p) => self.ctx.sample_top_p(&mut candidates, p),
+                Sampler::MinP(p) => self.ctx.sample_min_p(&mut candidates, p),
+                Sampler::TailFree(z) => self.ctx.sample_tail_free(&mut candidates, z),
+                Sampler::Typical(p) => self.ctx.sample_typical(&mut candidates, p),
                 Sampler::Temp(temp) => self.ctx.sample_temp(&mut candidates, temp),
             }
         }

@@ -1,3 +1,4 @@
+use std::cmp;
 use std::ffi::CString;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
@@ -322,7 +323,81 @@ impl<'a> LlamaContext<'a> {
         }
     }
 
+    pub fn sample_top_k(&self, candidates: &mut LlamaTokenDataArray, k: usize) {
+        if k == 0 {
+            return;
+        }
+        unsafe {
+            let k = cmp::min(k, candidates.len());
+            ffi::llama_sample_top_k(
+                self.as_ptr(),
+                candidates.as_mut_ptr(),
+                k.try_into().unwrap(),
+                1,  // min_keep
+            )
+        }
+    }
+
+    pub fn sample_top_p(&self, candidates: &mut LlamaTokenDataArray, p: f32) {
+        if p == 1. {
+            return;
+        }
+        unsafe {
+            ffi::llama_sample_top_p(
+                self.as_ptr(),
+                candidates.as_mut_ptr(),
+                p,
+                1,  // min_keep
+            )
+        }
+    }
+
+    pub fn sample_min_p(&self, candidates: &mut LlamaTokenDataArray, p: f32) {
+        if p == 0. {
+            return;
+        }
+        unsafe {
+            ffi::llama_sample_min_p(
+                self.as_ptr(),
+                candidates.as_mut_ptr(),
+                p,
+                1,  // min_keep
+            )
+        }
+    }
+
+    pub fn sample_tail_free(&self, candidates: &mut LlamaTokenDataArray, z: f32) {
+        if z == 1. {
+            return;
+        }
+        unsafe {
+            ffi::llama_sample_tail_free(
+                self.as_ptr(),
+                candidates.as_mut_ptr(),
+                z,
+                1,  // min_keep
+            )
+        }
+    }
+
+    pub fn sample_typical(&self, candidates: &mut LlamaTokenDataArray, p: f32) {
+        if p == 1. {
+            return;
+        }
+        unsafe {
+            ffi::llama_sample_typical(
+                self.as_ptr(),
+                candidates.as_mut_ptr(),
+                p,
+                1,  // min_keep
+            )
+        }
+    }
+
     pub fn sample_temp(&self, candidates: &mut LlamaTokenDataArray, temp: f32) {
+        if temp == 1. {
+            return;
+        }
         unsafe {
             ffi::llama_sample_temp(self.as_ptr(), candidates.as_mut_ptr(), temp)
         }
