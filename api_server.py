@@ -55,6 +55,8 @@ def kobold_convert_request(json_in):
         json_out['n_predict'] = val
     if (val := pop_field(json_in, 'control_vectors', list, None)) is not None:
         json_out['control_vectors'] = val
+    if (val := pop_field(json_in, 'memory', str, None)) is not None:
+        json_out['prompt_prefix'] = val
 
     sampler_order = pop_field(json_in, 'sampler_order', list, KOBOLD_DEFAULT_SAMPLER_ORDER)
     samplers = []

@@ -42,6 +42,12 @@ enum Request<'a> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CompletionRequest<'a> {
     prompt: Cow<'a, str>,
+    /// Prefix to add before the prompt.  If `prompt_prefix + prompt` exceeds the context length,
+    /// tokens are deleted from the start of `prompt` to make room.
+    prompt_prefix: Option<Cow<'a, str>>,
+    /// Prefix to add after the prompt.  If `prompt + prompt_suffix` exceeds the context length,
+    /// tokens are deleted from the start of `prompt` to make room.
+    prompt_suffix: Option<Cow<'a, str>>,
     #[serde(default = "const_usize::<128>")]
     n_predict: usize,
     #[serde(default)]
@@ -299,7 +305,18 @@ impl<'a, 'b> ServerContext<'a, 'b> {
         self.update_control_vectors(&req.control_vectors)?;
 
         // Tokenize and process the prompt.
-        let tokens = self.tokenize(&req.prompt)?;
+        let n_ctx = self.ctx.n_ctx();
+        if req.n_predict > n_ctx {
+            return Err("n_predict too big for context".into());
+        }
+        let tokens = self.build_prompt_tokens(
+            req.prompt_prefix.as_ref().map_or("", |s| s),
+            &req.prompt,
+            req.prompt_suffix.as_ref().map_or("", |s| s),
+            // This limit ensures there's enough context left for `n_predict` new tokens.
+            n_ctx - req.n_predict,
+        )?;
+
         let batch = batch_with_tokens(&tokens, /* start_pos: */ 0, /* seq_id: */ 0);
         self.ctx.decode(&batch)?;
         drop(batch);
@@ -749,6 +766,95 @@ impl<'a, 'b> ServerContext<'a, 'b> {
         Ok(tokens)
     }
 
+    /// Try to tokenize `prefix + prompt + suffix` into a vector containing at most `max_len`
+    /// tokens.  If it doesn't fit, initial tokens of `prompt` are discarded to make room.  If
+    /// `prefix + suffix` together exceed `max_len`, this returns an error.
+    fn build_prompt_tokens(
+        &self,
+        prefix: &str,
+        prompt: &str,
+        suffix: &str,
+        max_len: usize,
+    ) -> Result<Vec<LlamaToken>, String> {
+        let mut tokens = Vec::with_capacity(max_len);
+
+        // This is optimized for the case where `prefix + prompt + suffix` does fit, and we can
+        // simply tokenize all three into the same `tokens` buffer.
+
+        let prefix_len = match self.model.try_tokenize(prefix, &mut tokens, true, true) {
+            Ok(n) => n,
+            Err(n) => {
+                assert!(n > max_len);
+                return Err("prompt_prefix too long for context".into());
+            },
+        };
+
+        // When `prefix` and `suffix` both fit but `prompt` doesn't, this tells us where to insert
+        // the prompt tokens in the middle.
+        let mut prompt_insert_pos = None;
+        let prompt_len = match self.model.try_tokenize(prompt, &mut tokens, false, true) {
+            Ok(n) => n,
+            Err(n) => {
+                // Prompt didn't fit in the `tokens` buffer.  Record the fact that we need to
+                // insert it later.
+                prompt_insert_pos = Some(tokens.len());
+                n
+            },
+        };
+
+        let mut suffix_needs_insert = true;
+        let suffix_len = match self.model.try_tokenize(suffix, &mut tokens, false, true) {
+            Ok(n) => n,
+            Err(n) => {
+                suffix_needs_insert = false;
+                n
+            },
+        };
+
+        if prompt_insert_pos.is_none() && suffix_needs_insert {
+            // Prefix, prompt, and suffix were all tokenized into `tokens` successfully.
+            return Ok(tokens);
+        }
+
+        if suffix_len > max_len {
+            return Err("prompt_suffix too long for context".into());
+        }
+        if prefix_len + suffix_len > max_len {
+            return Err("prompt_prefix + prompt_suffix too long for context".into());
+        }
+
+        let target_prompt_len = max_len - (prefix_len + suffix_len);
+        assert!(target_prompt_len <= prompt_len);
+        let prompt_drop = prompt_len - target_prompt_len;
+
+        match (prompt_insert_pos, suffix_needs_insert) {
+            (None, false) => unreachable!(),
+            (Some(prompt_insert_pos), false) => {
+                // Suffix is in the buffer, but prompt didn't fit.  Tokenize the prompt, shift over
+                // the suffix, and insert the prompt tokens.
+                let mut prompt_tokens = Vec::with_capacity(prompt_len);
+                self.model.try_tokenize(prompt, &mut prompt_tokens, false, true).unwrap();
+                assert!(tokens.len() + (prompt_tokens.len() - prompt_drop) <= tokens.capacity());
+                vec_splice(&mut tokens, prompt_insert_pos, &prompt_tokens[prompt_drop..]);
+            },
+            (None, true) => {
+                // The prompt is in the buffer, but needs to be truncated to make room for the
+                // suffix.
+                let prompt_start = prefix_len;
+                tokens.drain(prompt_start .. prompt_start + prompt_drop);
+                assert!(tokens.len() + suffix_len <= tokens.capacity());
+                self.model.try_tokenize(suffix, &mut tokens, false, true).unwrap();
+            },
+            // It's impossible for both the prompt and the suffix to fail to fit.  If the prompt
+            // didn't fit, and thus wasn't written to `tokens`, then the suffix should fit
+            // according to the length check above.
+            (Some(_), true) => unreachable!(),
+        }
+
+        assert!(tokens.len() <= max_len);
+        Ok(tokens)
+    }
+
     /// Build an empty array of token data with length equal to `n_vocab`.
     fn empty_token_data(&self) -> Box<[LlamaTokenData]> {
         let n_vocab = self.model.n_vocab();
@@ -927,6 +1033,33 @@ fn batch_with_tokens(
         batch.push(tok, start_pos + i, seq_id, last);
     }
     batch
+}
+
+fn vec_splice<T: Copy>(dest: &mut Vec<T>, insert_pos: usize, src: &[T]) {
+    if insert_pos == dest.len() {
+        dest.extend_from_slice(src);
+        return;
+    }
+
+    unsafe {
+        dest.reserve(src.len());
+
+        // Shift the tail of the vector over to make room for `src`.
+        ptr::copy(
+            dest.as_ptr().add(insert_pos),
+            dest.as_mut_ptr().add(insert_pos + src.len()),
+            src.len(),
+        );
+
+        // Copy `src` into place.
+        ptr::copy_nonoverlapping(
+            src.as_ptr(),
+            dest.as_mut_ptr().add(insert_pos),
+            src.len(),
+        );
+
+        dest.set_len(dest.len() + src.len());
+    }
 }
 
 
