@@ -34,6 +34,7 @@ fn parse_args() -> ArgMatches {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Request<'a> {
     Completion(CompletionRequest<'a>),
+    StreamingCompletion(CompletionRequest<'a>),
     BatchCompletion(BatchCompletionRequest<'a>),
     HiddenStates(HiddenStatesRequest<'a>),
 }
@@ -171,6 +172,24 @@ struct HiddenStatesChunkHeader<'a> {
 }
 
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum StreamingCompletionResponse<'a> {
+    Done,
+    Error(ErrorResponse<'a>),
+    #[serde(untagged)]
+    Token(StreamingCompletionToken<'a>),
+}
+
+/// Chunk header used when streaming hidden state vectors.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StreamingCompletionToken<'a> {
+    /// The prompts whose data is contained in this chunk.
+    #[serde(rename = "t")]
+    token: Cow<'a, str>,
+}
+
+
 fn write_json(socket: &mut impl Write, x: &impl Serialize) -> io::Result<()> {
     serde_json::to_writer(&mut *socket, x)?;
     socket.write_all(b"\n")?;
@@ -239,6 +258,8 @@ impl<'a, 'b> ServerContext<'a, 'b> {
         match *req {
             Request::Completion(ref cr) =>
                 self.handle_completion_request(socket, cr),
+            Request::StreamingCompletion(ref cr) =>
+                self.handle_streaming_completion_request(socket, cr),
             Request::BatchCompletion(ref bcr) =>
                 self.handle_batch_completion_request(socket, bcr),
             Request::HiddenStates(ref hsr) =>
@@ -249,6 +270,22 @@ impl<'a, 'b> ServerContext<'a, 'b> {
     fn handle_completion_request(
         &mut self,
         socket: impl Write,
+        req: &CompletionRequest,
+    ) -> Result<(), String> {
+        self.handle_completion_request_common::<false>(socket, req)
+    }
+
+    fn handle_streaming_completion_request(
+        &mut self,
+        socket: impl Write,
+        req: &CompletionRequest,
+    ) -> Result<(), String> {
+        self.handle_completion_request_common::<true>(socket, req)
+    }
+
+    fn handle_completion_request_common<const STREAMING: bool>(
+        &mut self,
+        mut socket: impl Write,
         req: &CompletionRequest,
     ) -> Result<(), String> {
         let start = std::time::Instant::now();
@@ -265,7 +302,11 @@ impl<'a, 'b> ServerContext<'a, 'b> {
         // Sampling
         let eos_token = self.model.token_eos();
         let mut token_data = self.empty_token_data();
-        let mut content = Vec::with_capacity(5 * req.n_predict);
+        let mut content = if !STREAMING {
+            Vec::with_capacity(5 * req.n_predict)
+        } else {
+            Vec::with_capacity(64)
+        };
         let mut batch = LlamaBatch::new(1, 1);
         let mut tokens_generated = 0;
         for offset in 0 .. req.n_predict {
@@ -278,7 +319,17 @@ impl<'a, 'b> ServerContext<'a, 'b> {
                 break;
             }
             let token_bytes = self.model.token_to_piece(token, &mut content);
-            eprint!("{}", String::from_utf8_lossy(token_bytes));
+            let token_str = String::from_utf8_lossy(token_bytes);
+            eprint!("{}", token_str);
+            if STREAMING {
+                try_send_message(
+                    &mut socket,
+                    &StreamingCompletionResponse::Token(StreamingCompletionToken {
+                        token: token_str,
+                    }),
+                )?;
+                content.clear();
+            }
 
             // Process the newly added token.
             // TODO: Skip this part on the final iteration, since its results aren't used.
@@ -292,10 +343,17 @@ impl<'a, 'b> ServerContext<'a, 'b> {
         eprintln!("completed {} tokens in {:?}, {:.2} T/s",
             tokens_generated, dur, tokens_generated as f32 / dur.as_secs_f32());
 
-        let content = String::from_utf8_lossy(&content);
-        send_response(socket, &CompletionResponse {
-            content: content.into(),
-        }.into());
+        if !STREAMING {
+            let content = String::from_utf8_lossy(&content);
+            send_response(socket, &CompletionResponse {
+                content: content.into(),
+            }.into());
+        } else {
+            try_send_message(
+                socket,
+                &StreamingCompletionResponse::Done,
+            )?;
+        }
 
         Ok(())
     }
