@@ -106,7 +106,12 @@ class Client:
 @asynccontextmanager
 async def async_client(path):
     c = AsyncClient()
-    await c.connect(path)
+    try:
+        await c.connect(path)
+    except Exception as e:
+        print('failed to connect to %r: %s' % (path, e))
+        # FIXME: Figure out why this exception gets swallowed
+        raise
     yield c
     await c.close()
 
