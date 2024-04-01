@@ -37,6 +37,7 @@ enum Request<'a> {
     StreamingCompletion(CompletionRequest<'a>),
     BatchCompletion(BatchCompletionRequest<'a>),
     HiddenStates(HiddenStatesRequest<'a>),
+    Tokenize(TokenizeRequest<'a>),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -75,6 +76,11 @@ struct HiddenStatesRequest<'a> {
     samplers: Cow<'a, [Sampler]>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct TokenizeRequest<'a> {
+    prompt: Cow<'a, str>,
+}
+
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 struct ControlVector<'a> {
     #[serde(alias = "fname")]
@@ -104,6 +110,7 @@ enum Response<'a> {
     Completion(CompletionResponse<'a>),
     BatchCompletion(BatchCompletionResponse<'a>),
     HiddenStates(HiddenStatesResponse),
+    Tokenize(TokenizeResponse<'a>),
     Error(ErrorResponse<'a>),
 }
 
@@ -133,6 +140,10 @@ struct HiddenStatesResponse {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+struct TokenizeResponse<'a> {
+    tokens: Cow<'a, [LlamaToken]>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct ErrorResponse<'a> {
     msg: Cow<'a, str>,
 }
@@ -152,6 +163,12 @@ impl<'a> From<BatchCompletionResponse<'a>> for Response<'a> {
 impl<'a> From<HiddenStatesResponse> for Response<'a> {
     fn from(x: HiddenStatesResponse) -> Response<'a> {
         Response::HiddenStates(x)
+    }
+}
+
+impl<'a> From<TokenizeResponse<'a>> for Response<'a> {
+    fn from(x: TokenizeResponse<'a>) -> Response<'a> {
+        Response::Tokenize(x)
     }
 }
 
@@ -275,6 +292,8 @@ impl<'a, 'b> ServerContext<'a, 'b> {
                 self.handle_batch_completion_request(socket, bcr),
             Request::HiddenStates(ref hsr) =>
                 self.handle_hidden_states_request(socket, hsr),
+            Request::Tokenize(ref tr) =>
+                self.handle_tokenize_request(socket, tr),
         }
     }
 
@@ -756,6 +775,18 @@ impl<'a, 'b> ServerContext<'a, 'b> {
         drop(ctx);
 
         try_send_message(&mut socket, &HiddenStatesStreamingResponse::Done)?;
+        Ok(())
+    }
+
+    fn handle_tokenize_request(
+        &mut self,
+        socket: impl Write,
+        req: &TokenizeRequest,
+    ) -> Result<(), String> {
+        let tokens = self.tokenize(&req.prompt)?;
+        send_response(socket, &TokenizeResponse {
+            tokens: (&tokens).into(),
+        }.into());
         Ok(())
     }
 
