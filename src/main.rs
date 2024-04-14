@@ -325,6 +325,8 @@ impl<'a, 'b> ServerContext<'a, 'b> {
 
         // Tokenize and process the prompt.
         let n_ctx = self.ctx.n_ctx();
+        // FIXME: handle splitting an n_ctx-length prompt into n_batch sized chunks
+        let n_ctx = std::cmp::min(n_ctx, self.ctx.n_batch());
         if req.n_predict > n_ctx {
             return Err("n_predict too big for context".into());
         }
@@ -833,16 +835,17 @@ impl<'a, 'b> ServerContext<'a, 'b> {
             },
         };
 
-        let mut suffix_needs_insert = true;
+        // Do we need to insert the suffix after truncating the prompt?
+        let mut suffix_needs_insert = false;
         let suffix_len = match self.model.try_tokenize(suffix, &mut tokens, false, true) {
             Ok(n) => n,
             Err(n) => {
-                suffix_needs_insert = false;
+                suffix_needs_insert = true;
                 n
             },
         };
 
-        if prompt_insert_pos.is_none() && suffix_needs_insert {
+        if prompt_insert_pos.is_none() && !suffix_needs_insert {
             // Prefix, prompt, and suffix were all tokenized into `tokens` successfully.
             return Ok(tokens);
         }
