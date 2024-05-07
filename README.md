@@ -6,6 +6,7 @@ This should produce `libllama.a`, which is needed to build the server.
 
 Build the server by running `cargo build`.  Requires a Rust toolchain.
 
+
 # Running
 
 Start the core server like this:
@@ -23,6 +24,32 @@ protocol.  Some of the tools in this repo such as `train_control_vector.py` use
 the custom protocol directly.  For other frontends, like SillyTavern, run
 `python3 api_server.py` to start an HTTP server that translates between the
 kobold.cpp API and the custom protocol.
+
+
+# Training control vectors
+
+First, prepare a JSON file containing a list of prompt pairs:
+
+```javascript
+[
+    "positive prompt 1",
+    "negative prompt 1",
+    "positive prompt 2",
+    "negative prompt 2",
+    // etc.
+]
+```
+
+This can be done with a simple Python script, for example.
+
+Then, train the control vector by running:
+
+```sh
+python3 train_control_vector.py prompts.json out.gguf
+```
+
+Add `--mode mean-diff` to use the mean difference method instead of PCA.
+
 
 # Using control vectors
 
