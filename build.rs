@@ -5,9 +5,9 @@ use std::path::PathBuf;
 
 fn main() {
     let llama_cpp_include_dir = env::var("LLAMA_CPP_INCLUDEDIR")
-        .unwrap_or_else(|_| "../llama.cpp/".into());
+        .unwrap_or_else(|_| "llama.cpp/".into());
     let llama_cpp_lib_dir = env::var("LLAMA_CPP_LIBDIR")
-        .unwrap_or_else(|_| "../llama.cpp/".into());
+        .unwrap_or_else(|_| "llama.cpp/".into());
 
     println!("cargo:rustc-link-lib=static=ggml_static");
     println!("cargo:rustc-link-lib=static=llama");
