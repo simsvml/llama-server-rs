@@ -132,6 +132,7 @@ impl LlamaModel {
                 token,
                 space.as_mut_ptr().cast::<i8>(),
                 space.len().try_into().unwrap(),
+                true,   // special
             );
             if r < 0 {
                 // Not enough space in `buf`.
