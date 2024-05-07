@@ -27,6 +27,9 @@ fn parse_args() -> ArgMatches {
         .arg(Arg::new("ctx_size").short('c').long("ctx-size")
             .value_parser(value_parser!(usize))
             .default_value("4096"))
+        .arg(Arg::new("n_gpu_layers").long("n-gpu-layers").visible_alias("ngl")
+            .value_parser(value_parser!(usize))
+            .default_value("999"))
         .get_matches()
 }
 
@@ -1103,7 +1106,8 @@ fn main() -> io::Result<()> {
 
     // Load model
     let mut model_params = default_model_params();
-    model_params.n_gpu_layers = 999;
+    model_params.n_gpu_layers =
+        args.get_one::<usize>("n_gpu_layers").unwrap().clone().try_into().unwrap();
 
     let model_path: String = args.get_one::<String>("model").unwrap().clone();
     let model = LlamaModel::load_from_file(model_path, model_params).unwrap();
